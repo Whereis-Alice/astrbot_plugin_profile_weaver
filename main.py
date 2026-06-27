@@ -8,15 +8,26 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 
-from llm_tools import (
-    FORGET_TOOL_NAME,
-    REMEMBER_TOOL_NAME,
-    VIEW_TOOL_NAME,
-    ProfileWeaverForgetTool,
-    ProfileWeaverRememberTool,
-    ProfileWeaverViewTool,
-)
-from profile_store import AuditActor, DEFAULT_FIELDS, ProfileStore
+try:
+    from .llm_tools import (
+        FORGET_TOOL_NAME,
+        REMEMBER_TOOL_NAME,
+        VIEW_TOOL_NAME,
+        ProfileWeaverForgetTool,
+        ProfileWeaverRememberTool,
+        ProfileWeaverViewTool,
+    )
+    from .profile_store import AuditActor, DEFAULT_FIELDS, ProfileStore
+except ImportError:
+    from llm_tools import (
+        FORGET_TOOL_NAME,
+        REMEMBER_TOOL_NAME,
+        VIEW_TOOL_NAME,
+        ProfileWeaverForgetTool,
+        ProfileWeaverRememberTool,
+        ProfileWeaverViewTool,
+    )
+    from profile_store import AuditActor, DEFAULT_FIELDS, ProfileStore
 
 DEFAULT_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
 当前说话人：{sender_name} ({sender_id})
