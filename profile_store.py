@@ -8,7 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger
+
 NOTES_FIELD_NAME = "备注"
+LEGACY_PLUGIN_DIR_NAMES = ("astrbot_plugin_soulmap", "SoulMap", "soulmap")
 
 DEFAULT_FIELDS: list[tuple[str, str]] = [
     ("昵称", "用户希望被如何称呼"),
@@ -80,10 +83,12 @@ class ProfileStore:
         self.profiles_path = self.data_dir / "profiles.json"
         self.audit_log_path = self.data_dir / "audit_log.jsonl"
         self.legacy_profiles_path = self.data_dir / "user_profiles.json"
+        self.migration_state_path = self.data_dir / "migration_state.json"
         self.max_notes_count = max(1, min(int(max_notes_count), 20))
         self.custom_field_name_max_length = max(4, min(int(custom_field_name_max_length), 32))
         self.field_value_max_length = max(32, min(int(field_value_max_length), 500))
         self.builtin_field_map = self._build_builtin_field_map(builtin_fields)
+        self.migration_state = self._load_migration_state()
         self.profiles = self._load_profiles()
 
     @staticmethod
@@ -119,15 +124,17 @@ class ProfileStore:
             encoding="utf-8",
         )
 
-    def _load_profiles(self) -> dict[str, Any]:
-        if self.profiles_path.exists():
-            raw_profiles = self._read_json(self.profiles_path)
-        elif self.legacy_profiles_path.exists():
-            raw_profiles = self._migrate_legacy_profiles(self._read_json(self.legacy_profiles_path))
-            self._write_json(self.profiles_path, raw_profiles)
-        else:
-            raw_profiles = {}
+    def _load_migration_state(self) -> dict[str, Any]:
+        raw_state = self._read_json(self.migration_state_path)
+        sources = raw_state.get("sources")
+        if not isinstance(sources, dict):
+            sources = {}
+        return {"sources": sources}
 
+    def _save_migration_state(self) -> None:
+        self._write_json(self.migration_state_path, self.migration_state)
+
+    def _normalize_profiles_payload(self, raw_profiles: dict[str, Any]) -> dict[str, Any]:
         normalized: dict[str, Any] = {}
         for session_key, payload in raw_profiles.items():
             if not isinstance(payload, dict):
@@ -135,6 +142,18 @@ class ProfileStore:
             user_id = str(payload.get("subject_user_id") or self._extract_user_id_from_key(session_key))
             subject_name = str(payload.get("subject_name") or "")
             normalized[session_key] = self._normalize_profile_record(payload, user_id, subject_name)
+        return normalized
+
+    def _load_profiles(self) -> dict[str, Any]:
+        normalized = self._normalize_profiles_payload(self._read_json(self.profiles_path))
+        changed = False
+
+        for legacy_path in self._iter_legacy_profile_sources():
+            normalized, imported = self._maybe_import_legacy_source(normalized, legacy_path)
+            changed = changed or imported
+
+        if changed or (normalized and not self.profiles_path.exists()):
+            self._write_json(self.profiles_path, normalized)
         return normalized
 
     def _migrate_legacy_profiles(self, legacy_profiles: dict[str, Any]) -> dict[str, Any]:
@@ -145,6 +164,290 @@ class ProfileStore:
             user_id = self._extract_user_id_from_key(session_key)
             migrated[session_key] = self._normalize_profile_record(payload, user_id, "")
         return migrated
+
+    def _iter_legacy_profile_sources(self) -> list[Path]:
+        candidates: list[Path] = [self.legacy_profiles_path]
+        plugin_data_root = self.data_dir.parent
+        if plugin_data_root.exists():
+            for dirname in LEGACY_PLUGIN_DIR_NAMES:
+                candidates.append(plugin_data_root / dirname / "user_profiles.json")
+            try:
+                for sibling in plugin_data_root.iterdir():
+                    if not sibling.is_dir():
+                        continue
+                    if sibling.resolve() == self.data_dir.resolve():
+                        continue
+                    if "soulmap" in sibling.name.casefold():
+                        candidates.append(sibling / "user_profiles.json")
+            except OSError:
+                pass
+
+        unique_candidates: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            signature_key = str(path.resolve(strict=False)).casefold()
+            if signature_key in seen:
+                continue
+            seen.add(signature_key)
+            unique_candidates.append(path)
+        return unique_candidates
+
+    def _legacy_source_key(self, path: Path) -> str:
+        return str(path.resolve(strict=False))
+
+    def _legacy_source_signature(self, path: Path) -> str | None:
+        if not path.exists():
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        resolved = path.resolve(strict=False)
+        return f"{resolved}|{stat.st_mtime_ns}|{stat.st_size}"
+
+    def _maybe_import_legacy_source(
+        self,
+        current_profiles: dict[str, Any],
+        legacy_path: Path,
+    ) -> tuple[dict[str, Any], bool]:
+        source_signature = self._legacy_source_signature(legacy_path)
+        if source_signature is None:
+            return current_profiles, False
+
+        source_key = self._legacy_source_key(legacy_path)
+        previous_state = self.migration_state["sources"].get(source_key, {})
+        if previous_state.get("signature") == source_signature:
+            return current_profiles, False
+
+        migrated_profiles = self._migrate_legacy_profiles(self._read_json(legacy_path))
+        changed = False
+        merged_profiles = current_profiles
+        status = "empty"
+        if migrated_profiles:
+            merged_profiles, changed = self._merge_profiles(current_profiles, migrated_profiles)
+            status = "merged" if changed else "already_applied"
+            if changed:
+                logger.info(
+                    "[ProfileWeaver] Imported %s legacy profile records from %s",
+                    len(migrated_profiles),
+                    legacy_path,
+                )
+        else:
+            logger.warning("[ProfileWeaver] Legacy profile source %s is empty or unreadable", legacy_path)
+
+        self.migration_state["sources"][source_key] = {
+            "signature": source_signature,
+            "source_path": str(legacy_path.resolve(strict=False)),
+            "record_count": len(migrated_profiles),
+            "status": status,
+            "imported_at": self.now_text(),
+        }
+        self._save_migration_state()
+        return merged_profiles, changed
+
+    @staticmethod
+    def _coerce_timestamp(raw_value: Any) -> str:
+        text = str(raw_value or "").strip()
+        return text
+
+    def _pick_latest_timestamp(self, *values: Any) -> str:
+        timestamps = []
+        for value in values:
+            text = self._coerce_timestamp(value)
+            if text:
+                timestamps.append(text)
+        return max(timestamps) if timestamps else self.now_text()
+
+    def _pick_earliest_timestamp(self, *values: Any) -> str:
+        timestamps = []
+        for value in values:
+            text = self._coerce_timestamp(value)
+            if text:
+                timestamps.append(text)
+        return min(timestamps) if timestamps else self.now_text()
+
+    def _normalize_field_meta_entry(
+        self,
+        raw_metadata: Any,
+        fallback_updated_at: str,
+    ) -> dict[str, Any]:
+        if not isinstance(raw_metadata, dict):
+            raw_metadata = {}
+        return {
+            "updated_at": str(raw_metadata.get("updated_at") or fallback_updated_at),
+            "updated_by": str(raw_metadata.get("updated_by") or "unknown"),
+            "actor_id": str(raw_metadata.get("actor_id") or ""),
+            "actor_name": str(raw_metadata.get("actor_name") or ""),
+            "source_kind": str(raw_metadata.get("source_kind") or "unknown"),
+            "evidence": str(raw_metadata.get("evidence") or "").strip(),
+        }
+
+    def _merge_custom_field_meta(
+        self,
+        current_meta: Any,
+        incoming_meta: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(current_meta, dict):
+            current_meta = {}
+        if not isinstance(incoming_meta, dict):
+            incoming_meta = {}
+
+        current_created_at = self._coerce_timestamp(current_meta.get("created_at"))
+        incoming_created_at = self._coerce_timestamp(incoming_meta.get("created_at"))
+        prefer_incoming = bool(incoming_created_at and incoming_created_at >= current_created_at)
+        description = str(current_meta.get("description") or "").strip()
+        if prefer_incoming and str(incoming_meta.get("description") or "").strip():
+            description = str(incoming_meta.get("description") or "").strip()
+        elif not description:
+            description = str(incoming_meta.get("description") or "").strip()
+
+        created_by = str(current_meta.get("created_by") or "").strip()
+        if prefer_incoming and str(incoming_meta.get("created_by") or "").strip():
+            created_by = str(incoming_meta.get("created_by") or "").strip()
+        elif not created_by:
+            created_by = str(incoming_meta.get("created_by") or "unknown").strip()
+
+        return {
+            "description": description,
+            "created_at": self._pick_earliest_timestamp(
+                current_meta.get("created_at"),
+                incoming_meta.get("created_at"),
+            ),
+            "created_by": created_by or "unknown",
+        }
+
+    def _merge_field_meta_entry(
+        self,
+        current_meta: Any,
+        incoming_meta: Any,
+        fallback_updated_at: str,
+    ) -> dict[str, Any]:
+        normalized_current = self._normalize_field_meta_entry(current_meta, fallback_updated_at)
+        normalized_incoming = self._normalize_field_meta_entry(incoming_meta, fallback_updated_at)
+        current_updated_at = normalized_current["updated_at"]
+        incoming_updated_at = normalized_incoming["updated_at"]
+        if incoming_updated_at >= current_updated_at:
+            return normalized_incoming
+        return normalized_current
+
+    def _merge_note_values(
+        self,
+        current_value: Any,
+        incoming_value: Any,
+        *,
+        prefer_incoming_tail: bool,
+    ) -> list[str]:
+        current_notes = self._normalize_notes(current_value)
+        incoming_notes = self._normalize_notes(incoming_value)
+        if prefer_incoming_tail:
+            return self._normalize_notes([*current_notes, *incoming_notes])
+        return self._normalize_notes([*incoming_notes, *current_notes])
+
+    def _merge_profile_record(
+        self,
+        current_record: dict[str, Any],
+        incoming_record: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        merged = json.loads(json.dumps(current_record, ensure_ascii=False))
+        changed = False
+
+        merged["subject_user_id"] = str(
+            merged.get("subject_user_id") or incoming_record.get("subject_user_id") or ""
+        )
+        if not str(merged.get("subject_name") or "").strip() and str(incoming_record.get("subject_name") or "").strip():
+            merged["subject_name"] = str(incoming_record.get("subject_name") or "").strip()
+            changed = True
+
+        merged_created_at = self._pick_earliest_timestamp(
+            merged.get("created_at"),
+            incoming_record.get("created_at"),
+        )
+        if merged.get("created_at") != merged_created_at:
+            merged["created_at"] = merged_created_at
+            changed = True
+
+        merged_fields = merged.setdefault("fields", {})
+        merged_custom_fields = merged.setdefault("custom_fields", {})
+        merged_field_meta = merged.setdefault("field_meta", {})
+        incoming_fields = incoming_record.get("fields", {})
+        incoming_custom_fields = incoming_record.get("custom_fields", {})
+        incoming_field_meta = incoming_record.get("field_meta", {})
+
+        for field_name, incoming_value in incoming_fields.items():
+            current_value = merged_fields.get(field_name)
+            current_meta = merged_field_meta.get(field_name, {})
+            incoming_meta = incoming_field_meta.get(field_name, {})
+            current_field_updated_at = self._pick_latest_timestamp(
+                (current_meta or {}).get("updated_at") if isinstance(current_meta, dict) else "",
+                current_record.get("updated_at"),
+            )
+            incoming_field_updated_at = self._pick_latest_timestamp(
+                (incoming_meta or {}).get("updated_at") if isinstance(incoming_meta, dict) else "",
+                incoming_record.get("updated_at"),
+            )
+            normalized_meta = self._merge_field_meta_entry(
+                current_meta,
+                incoming_meta,
+                fallback_updated_at=self._pick_latest_timestamp(current_field_updated_at, incoming_field_updated_at),
+            )
+            incoming_is_newer = incoming_field_updated_at >= current_field_updated_at
+
+            if field_name == NOTES_FIELD_NAME:
+                merged_value = self._merge_note_values(
+                    current_value,
+                    incoming_value,
+                    prefer_incoming_tail=incoming_is_newer,
+                )
+            elif current_value is None or incoming_is_newer:
+                merged_value = incoming_value
+            else:
+                merged_value = current_value
+
+            if merged_value != current_value:
+                merged_fields[field_name] = merged_value
+                changed = True
+            if merged_field_meta.get(field_name) != normalized_meta:
+                merged_field_meta[field_name] = normalized_meta
+                changed = True
+
+        for field_name, incoming_meta in incoming_custom_fields.items():
+            merged_meta = self._merge_custom_field_meta(merged_custom_fields.get(field_name), incoming_meta)
+            if merged_custom_fields.get(field_name) != merged_meta:
+                merged_custom_fields[field_name] = merged_meta
+                changed = True
+
+        merged_updated_at = self._pick_latest_timestamp(
+            merged.get("updated_at"),
+            incoming_record.get("updated_at"),
+            *[
+                metadata.get("updated_at")
+                for metadata in merged_field_meta.values()
+                if isinstance(metadata, dict)
+            ],
+        )
+        if merged.get("updated_at") != merged_updated_at:
+            merged["updated_at"] = merged_updated_at
+            changed = True
+        return merged, changed
+
+    def _merge_profiles(
+        self,
+        current_profiles: dict[str, Any],
+        incoming_profiles: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        merged = json.loads(json.dumps(current_profiles, ensure_ascii=False))
+        changed = False
+        for session_key, incoming_record in incoming_profiles.items():
+            current_record = merged.get(session_key)
+            if not isinstance(current_record, dict):
+                merged[session_key] = incoming_record
+                changed = True
+                continue
+            merged_record, record_changed = self._merge_profile_record(current_record, incoming_record)
+            if record_changed:
+                merged[session_key] = merged_record
+                changed = True
+        return merged, changed
 
     @staticmethod
     def _extract_user_id_from_key(session_key: str) -> str:
@@ -251,12 +554,7 @@ class ProfileStore:
             field_name = self.normalize_field_name(raw_field_name)
             if not field_name or not isinstance(raw_metadata, dict):
                 continue
-            field_meta[field_name] = {
-                "updated_at": str(raw_metadata.get("updated_at") or updated_at),
-                "updated_by": str(raw_metadata.get("updated_by") or "unknown"),
-                "source_kind": str(raw_metadata.get("source_kind") or "unknown"),
-                "evidence": str(raw_metadata.get("evidence") or "").strip(),
-            }
+            field_meta[field_name] = self._normalize_field_meta_entry(raw_metadata, updated_at)
 
         return {
             "subject_user_id": subject_user_id,

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import AstrBotConfig, ToolSet, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 
 from llm_tools import (
@@ -69,13 +70,172 @@ THIRD_PARTY_MARKERS = (
     "他说",
     "她说",
 )
+HARD_THIRD_PARTY_MARKERS = (
+    "朋友说",
+    "他说",
+    "她说",
+    "他们说",
+    "她们说",
+    "别人说",
+    "群友说",
+    "转述",
+    "引用",
+    "代发",
+    "帮我问",
+    "替他说",
+    "替她说",
+)
+STRONG_SELF_MARKERS = (
+    "我是",
+    "我叫",
+    "我的",
+    "我喜欢",
+    "我爱吃",
+    "我不吃",
+    "我讨厌",
+    "我怕",
+    "我来自",
+    "我住在",
+    "我在",
+    "我学",
+    "我做",
+    "我有",
+    "我养",
+    "我平时",
+    "我通常",
+    "我一般",
+    "我自己",
+    "叫我",
+    "请叫我",
+    "可以叫我",
+    "本人",
+)
+PROFILE_SIGNAL_MARKERS = (
+    "叫我",
+    "称呼我",
+    "昵称",
+    "名字",
+    "我是",
+    "我叫",
+    "喜欢",
+    "爱吃",
+    "不吃",
+    "忌口",
+    "过敏",
+    "爱好",
+    "职业",
+    "工作",
+    "专业",
+    "学生",
+    "学校",
+    "生日",
+    "纪念日",
+    "所在地",
+    "来自",
+    "住在",
+    "城市",
+    "mbti",
+    "宠物",
+    "养了",
+    "作息",
+    "熬夜",
+    "早睡",
+    "晚睡",
+    "害怕",
+    "恐惧",
+    "弱点",
+    "擅长",
+    "熟悉",
+    "健康",
+    "更正",
+    "改成",
+    "不是",
+    "别记",
+    "删掉",
+    "删除",
+    "忘掉",
+)
+PRIVATE_PROFILE_PREFIXES = (
+    "叫我",
+    "请叫我",
+    "可以叫我",
+    "我是",
+    "我叫",
+    "我喜欢",
+    "我爱吃",
+    "我不吃",
+    "我讨厌",
+    "我怕",
+    "我来自",
+    "我住在",
+    "我在",
+    "我学",
+    "我做",
+    "我有",
+    "我养",
+    "我的",
+    "爱吃",
+    "不吃",
+    "过敏",
+    "喜欢",
+    "讨厌",
+    "来自",
+    "住在",
+    "学生",
+    "职业是",
+    "工作是",
+    "生日是",
+    "mbti是",
+)
+KNOWN_COMMAND_PREFIXES = (
+    "我的画像",
+    "画像字段",
+    "设置画像",
+    "删除画像",
+    "清空画像",
+    "查询画像",
+    "修改画像",
+    "删除画像字段",
+    "清空用户画像",
+    "画像审计",
+    "画像统计",
+)
+AMBIGUOUS_MULTI_SUBJECT_PATTERNS = (
+    re.compile(r"我和[^，。！？\s]{1,12}"),
+    re.compile(r"我跟[^，。！？\s]{1,12}"),
+    re.compile(r"我比(?!较)[^，。！？\s]{1,12}"),
+    re.compile(r"和我[^，。！？\s]{1,12}"),
+    re.compile(r"跟我[^，。！？\s]{1,12}"),
+)
+AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
+你是 ProfileWeaver 的后台画像抽取器。
+你的唯一任务：只依据“当前用户本轮消息”，决定是否为当前消息发送者调用画像工具。
+
+硬性规则：
+1. 只记录适合长期记忆、且明确属于当前发送者本人的信息。
+2. 提到别人、转述、玩笑、角色扮演、引用历史、猜测、临时状态时，宁可 NOOP。
+3. 优先直接更新字段，不要先删再加；只有用户明确要求删除或纠正时，才调用删除工具。
+4. 优先复用已有字段；确实不够表达时，才创建当前用户自定义字段。
+5. 如果没有明确可写入或删除的内容，直接回复 NOOP，不要调用工具。
+6. 你不能修改除当前发送者之外任何人的画像。
+
+当前说话人：{sender_name} ({sender_id})
+当前画像：
+{profile_summary}
+
+可用字段：
+{field_catalog}
+
+当前自定义字段：
+{custom_field_catalog}
+</ProfileWeaverAutoExtract>"""
 
 
 @register(
     "ProfileWeaver",
     "Whereis-Alice",
     "更安全的用户画像记忆插件，使用 LLM 工具替代隐藏标签写入，并为每位用户支持自定义画像字段。",
-    "2.0.0",
+    "2.1.0",
 )
 class ProfileWeaverPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -97,6 +257,12 @@ class ProfileWeaverPlugin(Star):
             ProfileWeaverRememberTool(plugin=self, active=self._llm_tools_enabled()),
             ProfileWeaverForgetTool(plugin=self, active=self._llm_tools_enabled()),
         )
+        self.auto_extract_tools = ToolSet(
+            tools=[
+                ProfileWeaverRememberTool(plugin=self, active=True),
+                ProfileWeaverForgetTool(plugin=self, active=True),
+            ]
+        )
 
     @property
     def session_based(self) -> bool:
@@ -113,6 +279,19 @@ class ProfileWeaverPlugin(Star):
 
     def _strict_identity_guard(self) -> bool:
         return bool(self.config.get("strict_identity_guard", True))
+
+    def _proactive_extraction_enabled(self) -> bool:
+        return bool(self.config.get("proactive_extraction_enabled", True))
+
+    def _proactive_extraction_min_length(self) -> int:
+        return max(4, min(int(self.config.get("proactive_extraction_min_message_length", 4)), 120))
+
+    def _proactive_extraction_max_length(self) -> int:
+        min_length = self._proactive_extraction_min_length()
+        return max(min_length, min(int(self.config.get("proactive_extraction_max_message_length", 120)), 500))
+
+    def _proactive_extraction_max_steps(self) -> int:
+        return max(1, min(int(self.config.get("proactive_extraction_max_steps", 2)), 3))
 
     def _debug_enabled(self) -> bool:
         return str(self.config.get("debug_log_level", "INFO")).upper() == "DEBUG"
@@ -135,13 +314,156 @@ class ProfileWeaverPlugin(Star):
         origin = str(event.unified_msg_origin or "")
         return "group" in origin.lower()
 
+    @staticmethod
+    def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+        lowered = str(text or "").casefold()
+        return any(marker.casefold() in lowered for marker in markers)
+
+    @staticmethod
+    def _starts_with_any(text: str, markers: tuple[str, ...]) -> bool:
+        lowered = str(text or "").strip().casefold()
+        return any(lowered.startswith(marker.casefold()) for marker in markers)
+
+    def _mentions_self(self, text: str) -> bool:
+        return self._contains_any(text, FIRST_PERSON_MARKERS)
+
+    def _mentions_strong_self(self, text: str) -> bool:
+        return self._contains_any(text, STRONG_SELF_MARKERS)
+
+    def _mentions_third_party(self, text: str) -> bool:
+        return self._contains_any(text, THIRD_PARTY_MARKERS)
+
+    def _mentions_hard_third_party(self, text: str) -> bool:
+        return self._contains_any(text, HARD_THIRD_PARTY_MARKERS)
+
+    @staticmethod
+    def _mentions_multi_subject_context(text: str) -> bool:
+        raw_text = str(text or "")
+        return any(pattern.search(raw_text) for pattern in AMBIGUOUS_MULTI_SUBJECT_PATTERNS)
+
+    @staticmethod
+    def _mark_profile_tool_used(event: AstrMessageEvent) -> None:
+        setattr(event, "_profileweaver_llm_tool_used", True)
+
+    @staticmethod
+    def _profile_tool_was_used(event: AstrMessageEvent) -> bool:
+        return bool(getattr(event, "_profileweaver_llm_tool_used", False))
+
+    @staticmethod
+    def _set_auto_extract_running(event: AstrMessageEvent, value: bool) -> None:
+        setattr(event, "_profileweaver_auto_extract_running", value)
+
+    @staticmethod
+    def _is_auto_extract_running(event: AstrMessageEvent) -> bool:
+        return bool(getattr(event, "_profileweaver_auto_extract_running", False))
+
     def _is_ambiguous_identity(self, message_text: str, evidence: str) -> bool:
         if not self._strict_identity_guard():
             return False
-        merged_text = f"{message_text}\n{evidence}".lower()
-        mentions_third_party = any(marker.lower() in merged_text for marker in THIRD_PARTY_MARKERS)
-        mentions_self = any(marker in f"{message_text}{evidence}" for marker in FIRST_PERSON_MARKERS)
+        merged_text = f"{message_text}\n{evidence}"
+        mentions_third_party = self._mentions_third_party(merged_text)
+        mentions_self = self._mentions_self(merged_text)
         return mentions_third_party and not mentions_self
+
+    def _looks_like_command(self, message_text: str) -> bool:
+        stripped = str(message_text or "").strip()
+        if not stripped:
+            return False
+        if self._starts_with_any(stripped, KNOWN_COMMAND_PREFIXES):
+            return True
+        return stripped[:1] in {"/", "!", "."}
+
+    def _is_profile_candidate_message(self, event: AstrMessageEvent, message_text: str) -> bool:
+        stripped = str(message_text or "").strip()
+        if not stripped:
+            return False
+        if self._looks_like_command(stripped):
+            return False
+        if len(stripped) < self._proactive_extraction_min_length():
+            return False
+        if len(stripped) > self._proactive_extraction_max_length():
+            return False
+        if stripped.count("\n") >= 3:
+            return False
+        if any(token in stripped for token in ("http://", "https://", "```", "[CQ:")):
+            return False
+        if self._mentions_hard_third_party(stripped):
+            return False
+        if self._mentions_multi_subject_context(stripped):
+            return False
+        if not self._contains_any(stripped, PROFILE_SIGNAL_MARKERS):
+            return False
+
+        has_self = self._mentions_self(stripped)
+        if has_self:
+            if self._mentions_third_party(stripped) and not self._mentions_strong_self(stripped):
+                return False
+            return True
+
+        if self._is_group_chat(event):
+            return False
+        if self._mentions_third_party(stripped):
+            return False
+        return self._starts_with_any(stripped, PRIVATE_PROFILE_PREFIXES)
+
+    def _build_auto_extract_system_prompt(self, event: AstrMessageEvent) -> str:
+        sender_id = str(event.get_sender_id())
+        sender_name = str(event.get_sender_name())
+        session_id = self._get_session_id(event)
+        return AUTO_EXTRACT_SYSTEM_PROMPT.format(
+            sender_id=sender_id,
+            sender_name=sender_name,
+            profile_summary=self.store.format_profile_summary(sender_id, session_id),
+            field_catalog=self.store.format_field_catalog(sender_id, session_id),
+            custom_field_catalog=self.store.format_custom_field_catalog(sender_id, session_id),
+        )
+
+    async def _resolve_chat_provider_id(self, event: AstrMessageEvent) -> str:
+        umo = str(event.unified_msg_origin or "")
+        if umo:
+            try:
+                return await self.context.get_current_chat_provider_id(umo)
+            except Exception as exc:
+                self._debug(f"resolve current provider id failed for {umo}: {exc}")
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if provider is None:
+            return ""
+        try:
+            return str(provider.meta().id or "")
+        except Exception as exc:
+            self._debug(f"resolve provider meta failed: {exc}")
+            return ""
+
+    async def _run_proactive_extraction(self, event: AstrMessageEvent, message_text: str) -> None:
+        provider_id = await self._resolve_chat_provider_id(event)
+        if not provider_id:
+            self._debug("skip proactive extraction: provider id unavailable")
+            return
+
+        prompt = (
+            "只根据下面这条当前用户消息，决定是否需要调用画像工具。\n"
+            f"当前消息：{message_text}\n"
+            "如果没有明确、稳定、适合长期记忆的信息，直接回复 NOOP。"
+        )
+        self._set_auto_extract_running(event, True)
+        try:
+            response = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=self._build_auto_extract_system_prompt(event),
+                tools=self.auto_extract_tools,
+                max_steps=self._proactive_extraction_max_steps(),
+                stream=False,
+            )
+            self._debug(
+                "proactive extraction finished with response: "
+                f"{str(response.completion_text or '').strip() or '<empty>'}"
+            )
+        except Exception as exc:
+            logger.warning("[ProfileWeaver] proactive extraction failed: %s", exc)
+        finally:
+            self._set_auto_extract_running(event, False)
 
     def _build_prompt(self, event: AstrMessageEvent) -> str:
         sender_id = str(event.get_sender_id())
@@ -180,6 +502,10 @@ class ProfileWeaverPlugin(Star):
             return "拒绝执行：evidence 必须直接来自当前用户本轮消息。"
         if self._is_ambiguous_identity(message_text, evidence_text):
             return "拒绝执行：当前消息同时提到其他人且缺少明确自述，容易写错对象。请先澄清，再决定是否记录。"
+        if (
+            self._mentions_third_party(message_text) or self._mentions_multi_subject_context(message_text)
+        ) and not self._mentions_self(evidence_text):
+            return "拒绝执行：当前消息提到他人时，evidence 还必须包含明确自述，避免截取成歧义片段。"
         return None
 
     def _ensure_known_or_creatable_field(
@@ -198,6 +524,7 @@ class ProfileWeaverPlugin(Star):
         return "拒绝执行：字段不存在。请优先使用已有字段；如果确实需要新字段，请明确允许创建自定义字段。"
 
     async def handle_llm_view(self, event: AstrMessageEvent) -> str:
+        self._mark_profile_tool_used(event)
         user_id = str(event.get_sender_id())
         session_id = self._get_session_id(event)
         summary = self.store.format_profile_summary(user_id, session_id)
@@ -215,6 +542,7 @@ class ProfileWeaverPlugin(Star):
         event: AstrMessageEvent,
         **kwargs: Any,
     ) -> str:
+        self._mark_profile_tool_used(event)
         if not self._llm_tools_enabled():
             return "画像工具当前已关闭。"
         field_name = str(kwargs.get("field_name") or "").strip()
@@ -260,6 +588,7 @@ class ProfileWeaverPlugin(Star):
         event: AstrMessageEvent,
         **kwargs: Any,
     ) -> str:
+        self._mark_profile_tool_used(event)
         if not self._llm_tools_enabled():
             return "画像工具当前已关闭。"
         field_selector = str(kwargs.get("field_selector") or "").strip()
@@ -284,9 +613,33 @@ class ProfileWeaverPlugin(Star):
 
     @filter.on_llm_request()
     async def inject_profile_context(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        if self._is_auto_extract_running(event):
+            return
         prompt = self._build_prompt(event)
         current_system_prompt = str(req.system_prompt or "").rstrip()
         req.system_prompt = f"{current_system_prompt}\n\n{prompt}".strip()
+
+    @filter.on_llm_response()
+    async def maybe_auto_extract_profile(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+        if not self._llm_tools_enabled() or not self._proactive_extraction_enabled():
+            return
+        if self._is_auto_extract_running(event):
+            return
+        if self._profile_tool_was_used(event):
+            self._debug("skip proactive extraction: profile tool already used in main run")
+            return
+
+        tool_names = set(getattr(response, "tools_call_name", []) or [])
+        if tool_names & {VIEW_TOOL_NAME, REMEMBER_TOOL_NAME, FORGET_TOOL_NAME}:
+            self._debug("skip proactive extraction: response already contains profile tool calls")
+            return
+
+        message_text = str(event.message_str or "").strip()
+        if not self._is_profile_candidate_message(event, message_text):
+            return
+
+        self._debug(f"trigger proactive extraction for sender {event.get_sender_id()}")
+        await self._run_proactive_extraction(event, message_text)
 
     @filter.command("我的画像")
     async def show_my_profile(self, event: AstrMessageEvent) -> None:
