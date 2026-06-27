@@ -1,7 +1,13 @@
-name: astrbot_plugin_soulmap
-display_name: 用户画像
-desc: AI驱动的用户画像收集系统，在聊天中自动提取用户信息（昵称、生日、饮食偏好、健康状况等），并在聊天中自然提及。
-help: 用户指令：我的画像、删除画像、清空画像；管理员指令：查询画像、导出画像
-version: v1.1.1
-author: 柯尔
-repo: https://github.com/Luna-channel/astrbot_plugin_soulmap
+name: astrbot_plugin_profile_weaver
+display_name: 画像织谱
+desc: 更安全的用户画像记忆插件，使用 LLM 工具显式维护当前说话人的画像，并支持每用户自定义字段。
+help: 用户命令：我的画像、画像字段、设置画像、删除画像、清空画像；管理员命令：查询画像、修改画像、删除画像字段、清空用户画像、画像审计、画像统计
+version: v2.0.0
+author: Whereis-Alice
+repo: https://github.com/Whereis-Alice/astrbot_plugin_profile_weaver
+astrbot_version: ">=4.16,<5"
+tags:
+  - memory
+  - profile
+  - llm-tool
+  - safety

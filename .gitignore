@@ -6,3 +6,4 @@ __pycache__/
 !_conf_schema.json
 .DS_Store
 *.log
+data/

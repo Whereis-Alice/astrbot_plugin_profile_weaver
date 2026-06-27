@@ -1,67 +1,101 @@
 {
-    "session_based": {
-        "description": "用户画像按窗口独立",
-        "type": "bool",
-        "default": false,
-        "hint": "关闭时（默认），同一用户跨群共用同一份画像；开启后每个群聊/私聊的画像数据相互独立。"
-    },
-    "allowed_fields": {
-        "description": "允许记录的画像字段",
-        "type": "list",
-        "default": [
-            "对用户的称呼",
-            "性别",
-            "年龄",
-            "所在地",
-            "生日",
-            "爱吃",
-            "忌口",
-            "爱好",
-            "职业",
-            "重要节日",
-            "恐惧/弱点",
-            "作息规律",
-            "技能水平",
-            "健康状况",
-            "宠物",
-            "备注"
-        ],
-        "hint": "直接写字段名，支持中文。添加新字段如\"年龄\"即可，AI会自动识别。"
-    },
-    "max_notes_count": {
-        "description": "备注保留条数",
-        "type": "int",
-        "default": 5,
-        "hint": "备注字段最多保留的条目数，超出时旧记录会被挤掉。"
-    },
-    "admin_permission_denied_msg": {
-        "description": "管理员命令权限不足提示",
-        "type": "string",
-        "default": "错误：此命令仅限管理员使用。",
-        "hint": "当非管理员用户尝试使用管理员命令时的提示语。"
-    },
-    "profile_prompt": {
-        "description": "画像系统提示词",
-        "type": "text",
-        "default": "<用户画像系统>\n<当前画像>\n{profile_summary}\n</当前画像>\n<可用字段>{allowed_fields_display}</可用字段>\n\n【核心规则】\n★ 仅在用户主动提及相关话题时，才使用画像中的信息 ★\n\n<记录规则>\n1. 用户主动提及时自动记录，不刻意套话、不主动询问\n2. 更新备注之外的消息时带上旧信息一起覆写，如：用户之前爱吃火锅，现在说也喜欢奶茶→[Profile: 爱吃=火锅、奶茶]\n3. 备注字段：每条不超过20字，用分号分隔，系统自动保留最近{max_notes_count}条，显示为1.xxx 2.xxx格式，你不需要输出编号，编号会自动填写，也不需要重复之前的信息\n4.优先把信息填入已有的字段，再考虑填入备注，因为备注不是永久保存的。\n5.每次回复中，同一个字段只输出一条最终结果的标记，不要输出中间步骤或重复标记。如需先删后写，只输出一个[ProfileDelete]和一个[Profile]即可。\n</记录规则>\n\n<输出格式>\n记录/更新：[Profile: 字段=值] 或 [Profile: 对用户的称呼=小明, 性别=女]\n删除备注条目：[ProfileDelete: 条目编号] 如 [ProfileDelete: 1] 或 [ProfileDelete: 1, 2]\n删除整个字段：[ProfileDelete: 字段名] 如 [ProfileDelete: 对用户的称呼]\n</输出格式>\n</用户画像系统>",
-        "hint": "支持变量：{profile_summary}当前画像摘要、{allowed_fields_display}可用字段列表、{max_notes_count}备注保留条数"
-    },
-    "allow_profile_in_group": {
-        "description": "允许在群聊中查看画像",
-        "type": "bool",
-        "default": false,
-        "hint": "关闭时（默认），用户在群聊中使用/我的画像会收到提示，需要私聊查看；开启后允许在群聊中直接查看画像。"
-    },
-    "group_profile_denied_msg": {
-        "description": "群聊画像请求拒绝提示",
-        "type": "string",
-        "default": "画像内容可能涉及隐私，请在私聊查看",
-        "hint": "当用户在群聊中请求查看画像但开关关闭时的提示语。"
-    },
-    "debug_log_level": {
-        "description": "日志级别",
-        "type": "string",
-        "default": "INFO",
-        "hint": "可选：DEBUG（详细调试信息）或 INFO（只输出关键信息）"
-    }
+  "session_based": {
+    "type": "bool",
+    "description": "是否按会话隔离用户画像",
+    "default": false,
+    "hint": "关闭时，同一用户跨群共享画像；开启后，不同群聊/私聊分别维护。"
+  },
+  "default_fields": {
+    "type": "list",
+    "description": "默认基础画像字段",
+    "default": [
+      "昵称",
+      "性别",
+      "年龄",
+      "所在地",
+      "生日",
+      "爱吃",
+      "忌口",
+      "爱好",
+      "职业",
+      "重要节日",
+      "恐惧/弱点",
+      "作息规律",
+      "技能水平",
+      "健康状况",
+      "宠物",
+      "备注"
+    ],
+    "hint": "这里定义全局基础字段。LLM 和用户命令还可以在单个用户画像上创建自定义字段。"
+  },
+  "max_notes_count": {
+    "type": "int",
+    "description": "备注保留条数",
+    "default": 5,
+    "hint": "备注字段会自动保留最近几条，超出的旧备注会被挤掉。"
+  },
+  "llm_tools_enabled": {
+    "type": "bool",
+    "description": "是否启用 LLM 画像工具",
+    "default": true,
+    "hint": "关闭后，LLM 只能看到画像上下文，不能直接增删改画像。"
+  },
+  "allow_llm_custom_fields": {
+    "type": "bool",
+    "description": "是否允许 LLM 创建自定义画像字段",
+    "default": true,
+    "hint": "开启后，当基础字段不够时，LLM 可以为当前用户创建专属字段。"
+  },
+  "allow_user_custom_fields": {
+    "type": "bool",
+    "description": "是否允许用户通过命令创建自定义字段",
+    "default": true,
+    "hint": "关闭后，用户用“设置画像”只能修改已有字段。"
+  },
+  "strict_identity_guard": {
+    "type": "bool",
+    "description": "是否启用当前说话人身份护栏",
+    "default": true,
+    "hint": "开启后，消息里如果明显提到其他人且缺少明确自述，LLM 工具会拒绝写入画像。"
+  },
+  "custom_field_name_max_length": {
+    "type": "int",
+    "description": "自定义字段名最大长度",
+    "default": 16,
+    "hint": "建议不要太长，避免 LLM 创建过度细碎的字段。"
+  },
+  "field_value_max_length": {
+    "type": "int",
+    "description": "单个字段值最大长度",
+    "default": 160,
+    "hint": "超过长度的内容会被截断，避免把整段聊天记录塞进画像。"
+  },
+  "allow_profile_in_group": {
+    "type": "bool",
+    "description": "是否允许在群聊里查看“我的画像”",
+    "default": false,
+    "hint": "关闭时，群聊中查看画像会被拒绝，以降低隐私泄露风险。"
+  },
+  "group_profile_denied_msg": {
+    "type": "string",
+    "description": "群聊查看画像被拒绝时的提示语",
+    "default": "画像内容可能涉及隐私，请私聊查看。",
+    "hint": "当 allow_profile_in_group=false 时生效。"
+  },
+  "profile_prompt_template": {
+    "type": "text",
+    "description": "注入给 LLM 的画像提示模板",
+    "default": "<ProfileWeaver>\n当前说话人：{sender_name} ({sender_id})\n画像作用域：{session_scope}\n\n当前画像：\n{profile_summary}\n\n基础字段：\n{field_catalog}\n\n当前自定义字段：\n{custom_field_catalog}\n\n规则：\n1. 这些画像只属于当前消息发送者，不属于你自己，也不属于别的群友。\n2. 只有当前发送者明确谈论自己、表达稳定偏好、或纠正自己的信息时，才允许调用画像写入工具。\n3. 当前消息提到其他人、转述他人、开玩笑、角色扮演、引用历史聊天、或信息不确定时，不要写入画像。\n4. 优先复用已有字段；确实不够表达时，才允许创建当前用户专属自定义字段。\n5. 临时状态、推测、系统设定、消息过程信息不要存入画像。\n6. 删除画像前，必须确认用户明确要求删除或纠正。\n\n可用工具：{tool_names}\n</ProfileWeaver>",
+    "hint": "支持变量：{sender_id} {sender_name} {session_scope} {profile_summary} {field_catalog} {custom_field_catalog} {tool_names}"
+  },
+  "debug_log_level": {
+    "type": "string",
+    "description": "日志级别",
+    "default": "INFO",
+    "options": [
+      "INFO",
+      "DEBUG"
+    ],
+    "hint": "DEBUG 会输出更多工具调用和身份护栏日志。"
+  }
 }

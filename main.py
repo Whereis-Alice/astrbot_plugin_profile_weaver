@@ -1,446 +1,474 @@
-import json
-import re
-from pathlib import Path
-from typing import Dict, Any, Optional
-from datetime import datetime
+from __future__ import annotations
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.api.provider import LLMResponse, ProviderRequest
+from typing import Any
+
 from astrbot.api import AstrBotConfig, logger
-from astrbot.core.message.components import Plain
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
+from astrbot.api.star import Context, Star, StarTools, register
+
+from llm_tools import (
+    FORGET_TOOL_NAME,
+    REMEMBER_TOOL_NAME,
+    VIEW_TOOL_NAME,
+    ProfileWeaverForgetTool,
+    ProfileWeaverRememberTool,
+    ProfileWeaverViewTool,
+)
+from profile_store import AuditActor, DEFAULT_FIELDS, ProfileStore
+
+DEFAULT_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
+当前说话人：{sender_name} ({sender_id})
+画像作用域：{session_scope}
+
+当前画像：
+{profile_summary}
+
+基础字段：
+{field_catalog}
+
+当前自定义字段：
+{custom_field_catalog}
+
+规则：
+1. 这些画像只属于当前消息发送者，不属于你自己，也不属于别的群友。
+2. 只有当前发送者明确谈论自己、表达稳定偏好、或纠正自己的信息时，才允许调用画像写入工具。
+3. 当前消息提到其他人、转述他人、开玩笑、角色扮演、引用历史聊天、或信息不确定时，不要写入画像。
+4. 优先复用已有字段；确实不够表达时，才允许创建当前用户专属自定义字段。
+5. 临时状态、推测、系统设定、消息过程信息不要存入画像。
+6. 删除画像前，必须确认用户明确要求删除或纠正。
+
+可用工具：{tool_names}
+</ProfileWeaver>"""
+
+REMEMBER_SOURCE_KINDS = {"self_report", "self_preference", "self_correction"}
+FORGET_SOURCE_KINDS = {"self_request", "self_correction"}
+FIRST_PERSON_MARKERS = (
+    "我",
+    "我的",
+    "我是",
+    "我叫",
+    "本人",
+    "俺",
+    "咱",
+    "自己",
+    "纠正一下",
+    "更正一下",
+)
+THIRD_PARTY_MARKERS = (
+    "@",
+    "他",
+    "她",
+    "ta",
+    "TA",
+    "他们",
+    "她们",
+    "别人",
+    "群友",
+    "朋友说",
+    "他说",
+    "她说",
+)
 
 
-class SoulMapManager:
-    """
-    用户画像管理系统 (SoulMap)
-    - 所有字段统一为字符串类型，AI负责数据格式管理
-    - 备注字段特殊处理：追加模式，保留最近N条
-    """
-
-    def __init__(self, data_path: Path, allowed_fields: list, max_notes_count: int = 5):
-        self.data_path = data_path
-        self.allowed_fields = allowed_fields
-        self.max_notes_count = max_notes_count
-        self._init_path()
-        self.user_data = self._load_data("user_profiles.json")
-
-    def _init_path(self):
-        self.data_path.mkdir(parents=True, exist_ok=True)
-
-    def _load_data(self, filename: str) -> Dict[str, Any]:
-        path = self.data_path / filename
-        if not path.exists():
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.error(f"[SoulMap] 加载数据失败: {e}")
-            return {}
-        except (IOError, OSError) as e:
-            logger.error(f"[SoulMap] 读取文件失败: {e}")
-            return {}
-
-    def _save_data(self):
-        path = self.data_path / "user_profiles.json"
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.user_data, f, ensure_ascii=False, indent=2)
-        except (IOError, OSError) as e:
-            logger.error(f"[SoulMap] 写入文件失败: {e}")
-        except (TypeError, ValueError) as e:
-            logger.error(f"[SoulMap] 序列化数据失败: {e}")
-
-    def _get_user_key(self, user_id: str, session_id: Optional[str] = None) -> str:
-        return f"{session_id}_{user_id}" if session_id else user_id
-
-    def get_user_profile(self, user_id: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-        key = self._get_user_key(user_id, session_id)
-        return self.user_data.get(key, {}).copy()
-
-    def update_field(self, user_id: str, field: str, value: str, 
-                     session_id: Optional[str] = None, save: bool = True) -> tuple:
-        """更新字段值，备注字段特殊处理。save=False 时跳过写盘（用于批量操作）"""
-        if field not in self.allowed_fields:
-            return False, f"字段 '{field}' 不在允许列表中"
-
-        key = self._get_user_key(user_id, session_id)
-        if key not in self.user_data:
-            self.user_data[key] = {}
-
-        value = value.strip()
-        
-        # 备注字段特殊处理：追加模式，保留最近N条
-        if field == "备注":
-            existing = self.user_data[key].get("备注", "")
-            # 解析现有备注（以顿号或分号分隔）
-            if existing:
-                notes = [n.strip() for n in re.split(r'[；;]', existing) if n.strip()]
-            else:
-                notes = []
-            # 解析新备注
-            new_notes = [n.strip()[:20] for n in re.split(r'[；;]', value) if n.strip()]
-            # 去重并追加
-            for note in new_notes:
-                if note not in notes:
-                    notes.append(note)
-            # 保留最近N条
-            notes = notes[-self.max_notes_count:]
-            value = "；".join(notes)
-        
-        self.user_data[key][field] = value
-        self.user_data[key]["_last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        if save:
-            self._save_data()
-        return True, f"已更新 {field}"
-
-    def delete_field(self, user_id: str, field: str, session_id: Optional[str] = None, save: bool = True) -> tuple:
-        """删除字段或备注条目（支持数字索引）。save=False 时跳过写盘（用于批量操作）"""
-        key = self._get_user_key(user_id, session_id)
-        if key not in self.user_data:
-            return False, "没有找到你的画像数据"
-
-        # 1. 精确匹配字段名
-        if field in self.user_data[key]:
-            del self.user_data[key][field]
-            self.user_data[key]["_last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if save:
-                self._save_data()
-            return True, f"已删除字段 {field}"
-
-        # 2. 数字索引：删除备注中的第N条
-        if "备注" in self.user_data[key] and field.isdigit():
-            idx = int(field) - 1  # 转为0索引
-            notes = [n.strip() for n in re.split(r'[；;]', self.user_data[key]["备注"]) if n.strip()]
-            if 0 <= idx < len(notes):
-                deleted_note = notes.pop(idx)
-                if notes:
-                    self.user_data[key]["备注"] = "；".join(notes)
-                else:
-                    del self.user_data[key]["备注"]
-                self.user_data[key]["_last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if save:
-                    self._save_data()
-                return True, f"已删除备注第{field}条：{deleted_note}"
-            return False, f"备注第{field}条不存在"
-
-        # 3. 模糊匹配：在备注中搜索并删除包含该内容的条目
-        if "备注" in self.user_data[key]:
-            notes = [n.strip() for n in re.split(r'[；;]', self.user_data[key]["备注"]) if n.strip()]
-            new_notes = [n for n in notes if field not in n]
-            if len(new_notes) < len(notes):
-                if new_notes:
-                    self.user_data[key]["备注"] = "；".join(new_notes)
-                else:
-                    del self.user_data[key]["备注"]
-                self.user_data[key]["_last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if save:
-                    self._save_data()
-                return True, f"已从备注中删除包含 '{field}' 的条目"
-
-        return False, f"未找到字段或备注条目 '{field}'"
-
-    def clear_profile(self, user_id: str, session_id: Optional[str] = None) -> bool:
-        key = self._get_user_key(user_id, session_id)
-        if key in self.user_data:
-            del self.user_data[key]
-            self._save_data()
-            return True
-        return False
-
-    def format_profile_summary(self, user_id: str, session_id: Optional[str] = None) -> str:
-        """格式化用户画像摘要"""
-        profile = self.get_user_profile(user_id, session_id)
-        if not profile:
-            return "暂无记录"
-
-        lines = []
-        for field in self.allowed_fields:
-            if field in profile and profile[field]:
-                # 备注字段按条显示：1.xxx 2.xxx
-                if field == "备注":
-                    notes = [n.strip() for n in re.split(r'[；;]', profile[field]) if n.strip()]
-                    notes_display = " ".join([f"{i}.{note}" for i, note in enumerate(notes, 1)])
-                    lines.append(f"- 备注：{notes_display}")
-                else:
-                    lines.append(f"- {field}：{profile[field]}")
-
-        return "\n".join(lines) if lines else "暂无记录"
-
-    def export_all_profiles(self) -> Dict[str, Any]:
-        return self.user_data.copy()
-
-
-@register("SoulMap", "柯尔", "AI驱动的用户画像收集系统，简洁设计，AI负责数据管理", "1.1.1")
-class SoulMapPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+@register(
+    "ProfileWeaver",
+    "Whereis-Alice",
+    "更安全的用户画像记忆插件，使用 LLM 工具替代隐藏标签写入，并为每位用户支持自定义画像字段。",
+    "2.0.0",
+)
+class ProfileWeaverPlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.config = config
-
         data_dir = StarTools.get_data_dir()
-
-        # 从配置读取字段列表，直接使用
-        allowed_fields = self.config.get("allowed_fields", [
-            "昵称", "性别", "年龄", "所在地", "生日", "爱吃", "忌口",
-            "爱好", "职业", "重要节日", "恐惧/弱点", "作息规律", "技能水平",
-            "健康状况", "宠物", "备注"
-        ])
-        max_notes_count = self.config.get("max_notes_count", 5)
-
-        self.manager = SoulMapManager(data_dir, allowed_fields, max_notes_count)
-
-        # 正则模式（支持中文字段名）
-        self.profile_pattern = re.compile(r"\[Profile:\s*([^\]]+)\]", re.IGNORECASE)
-        # 支持多字段删除: [ProfileDelete: 字段1, 字段2] 或 [ProfileDelete: 字段]
-        self.delete_pattern = re.compile(r"\[ProfileDelete:\s*([^\]]+)\]", re.IGNORECASE)
-        self.block_pattern = re.compile(r"\s*\[(?:Profile|ProfileDelete):[^\]]*\]\s*", re.IGNORECASE)
+        default_fields = self.config.get("default_fields") or self.config.get("allowed_fields") or [
+            name for name, _ in DEFAULT_FIELDS
+        ]
+        self.store = ProfileStore(
+            data_dir=data_dir,
+            builtin_fields=default_fields,
+            max_notes_count=self.config.get("max_notes_count", 5),
+            custom_field_name_max_length=self.config.get("custom_field_name_max_length", 16),
+            field_value_max_length=self.config.get("field_value_max_length", 160),
+        )
+        self.context.add_llm_tools(
+            ProfileWeaverViewTool(plugin=self, active=self._llm_tools_enabled()),
+            ProfileWeaverRememberTool(plugin=self, active=self._llm_tools_enabled()),
+            ProfileWeaverForgetTool(plugin=self, active=self._llm_tools_enabled()),
+        )
 
     @property
     def session_based(self) -> bool:
         return bool(self.config.get("session_based", False))
 
-    def _get_session_id(self, event: AstrMessageEvent) -> Optional[str]:
+    def _llm_tools_enabled(self) -> bool:
+        return bool(self.config.get("llm_tools_enabled", True))
+
+    def _allow_llm_custom_fields(self) -> bool:
+        return bool(self.config.get("allow_llm_custom_fields", True))
+
+    def _allow_user_custom_fields(self) -> bool:
+        return bool(self.config.get("allow_user_custom_fields", True))
+
+    def _strict_identity_guard(self) -> bool:
+        return bool(self.config.get("strict_identity_guard", True))
+
+    def _debug_enabled(self) -> bool:
+        return str(self.config.get("debug_log_level", "INFO")).upper() == "DEBUG"
+
+    def _debug(self, message: str) -> None:
+        if self._debug_enabled():
+            logger.debug(f"[ProfileWeaver] {message}")
+
+    def _get_session_id(self, event: AstrMessageEvent) -> str | None:
         return event.unified_msg_origin if self.session_based else None
 
-    def _get_allowed_fields_display(self) -> str:
-        """生成可用字段的显示字符串"""
-        return "/".join(self.manager.allowed_fields)
-
-    @filter.on_llm_request()
-    async def add_profile_context(self, event: AstrMessageEvent, req: ProviderRequest):
-        """注入画像信息"""
-        user_id = event.get_sender_id()
-        session_id = self._get_session_id(event)
-
-        profile_summary = self.manager.format_profile_summary(user_id, session_id)
-        allowed_fields_display = self._get_allowed_fields_display()
-        max_notes_count = str(self.config.get("max_notes_count", 5))
-        
-        profile_prompt = self.config.get("profile_prompt", "")
-        
-        if profile_prompt:
-            try:
-                profile_prompt = profile_prompt.format(
-                    profile_summary=profile_summary,
-                    allowed_fields_display=allowed_fields_display,
-                    max_notes_count=max_notes_count
-                )
-            except KeyError:
-                # 兼容旧格式，使用replace
-                profile_prompt = profile_prompt.replace("{profile_summary}", profile_summary)
-                profile_prompt = profile_prompt.replace("{allowed_fields_display}", allowed_fields_display)
-                profile_prompt = profile_prompt.replace("{max_notes_count}", max_notes_count)
-            req.system_prompt += f"\n{profile_prompt}"
-
-    @filter.on_llm_response()
-    async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
-        """解析并更新画像（合并同一回复中的重复操作，统一写盘一次）"""
-        user_id = event.get_sender_id()
-        session_id = self._get_session_id(event)
-        original_text = resp.completion_text or ""
-
-        logger.debug(f"[SoulMap] on_llm_resp 被调用 - 用户: {user_id}, session_id: {session_id}, session_based: {self.session_based}")
-        logger.debug(f"[SoulMap] 原始文本长度: {len(original_text)}")
-
-        if not original_text:
-            logger.debug("[SoulMap] 原始文本为空，直接返回")
-            return
-
-        # ---- 第一步：收集所有操作，按出现顺序记录 ----
-        # 用 (操作类型, 位置) 排序来保证按原文顺序执行
-        ops = []  # [(pos, 'update'|'delete', field, value|None), ...]
-
-        for m in self.profile_pattern.finditer(original_text):
-            match_text = m.group(1)
-            pos = m.start()
-            pairs = re.findall(
-                r'([\w\u4e00-\u9fff/]+)\s*=\s*([^,，]*(?:[,，](?!\s*[\w\u4e00-\u9fff/]+=)[^,，]*)*)',
-                match_text
-            )
-            for field, value in pairs:
-                ops.append((pos, 'update', field.strip(), value.strip()))
-
-        for m in self.delete_pattern.finditer(original_text):
-            match_text = m.group(1)
-            pos = m.start()
-            fields = [f.strip() for f in re.split(r'[,，;；、]', match_text) if f.strip()]
-            for field in fields:
-                ops.append((pos, 'delete', field, None))
-
-        # 按出现位置排序
-        ops.sort(key=lambda x: x[0])
-
-        # ---- 第二步：同一字段去重，只保留最后一次操作 ----
-        # 对于备注字段：如果最后一个操作是 update 且包含完整内容，前面的中间步骤可以跳过
-        final_ops = {}  # field -> (op_type, value)
-        for _, op_type, field, value in ops:
-            final_ops[field] = (op_type, value)
-
-        if not final_ops:
-            # 没有任何画像操作，只清理标签就返回
-            resp.completion_text = self.block_pattern.sub('', original_text).strip()
-            if resp.result_chain and resp.result_chain.chain:
-                for comp in resp.result_chain.chain:
-                    if isinstance(comp, Plain) and comp.text:
-                        comp.text = self.block_pattern.sub('', comp.text).strip()
-            return
-
-        logger.debug(f"[SoulMap] 原始操作数: {len(ops)}, 去重后: {len(final_ops)}")
-
-        # ---- 第三步：按正确顺序执行（先删后写），不逐次写盘 ----
-        has_changes = False
-
-        # 先执行所有删除
-        delete_fields = [(f, v) for f, (op, v) in final_ops.items() if op == 'delete']
-        # 数字索引从大到小，避免删除后索引错位
-        digit_deletes = sorted([f for f, _ in delete_fields if f.isdigit()], key=int, reverse=True)
-        other_deletes = [f for f, _ in delete_fields if not f.isdigit()]
-
-        for field in other_deletes + digit_deletes:
-            success, msg = self.manager.delete_field(user_id, field, session_id, save=False)
-            if success:
-                has_changes = True
-                logger.info(f"[SoulMap] {user_id} 删除成功: {field}")
-            else:
-                logger.warning(f"[SoulMap] {user_id} 删除失败: {field}, 原因: {msg}")
-
-        # 再执行所有更新
-        for field, (op_type, value) in final_ops.items():
-            if op_type != 'update':
-                continue
-            success, msg = self.manager.update_field(user_id, field, value, session_id, save=False)
-            if success:
-                has_changes = True
-                logger.info(f"[SoulMap] {user_id} 更新成功: {field}={value}")
-            else:
-                logger.warning(f"[SoulMap] {user_id} 更新失败: {field}={value}, 原因: {msg}")
-
-        # ---- 第四步：统一写盘一次 ----
-        if has_changes:
-            self.manager._save_data()
-            logger.debug(f"[SoulMap] {user_id} 批量操作完成，统一写盘")
-
-        # 清理标签
-        resp.completion_text = self.block_pattern.sub('', original_text).strip()
-        if resp.result_chain and resp.result_chain.chain:
-            for comp in resp.result_chain.chain:
-                if isinstance(comp, Plain) and comp.text:
-                    comp.text = self.block_pattern.sub('', comp.text).strip()
-
-    @filter.on_decorating_result()
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        """最后清理"""
-        result = event.get_result()
-        if result is None or not result.chain:
-            return
-
-        for comp in result.chain:
-            if isinstance(comp, Plain) and comp.text:
-                cleaned = self.block_pattern.sub('', comp.text).strip()
-                if cleaned != comp.text:
-                    comp.text = cleaned
-
-    # ------------------- 用户命令 -------------------
+    def _build_actor(self, event: AstrMessageEvent, actor_type: str) -> AuditActor:
+        return AuditActor(
+            actor_type=actor_type,
+            actor_id=str(event.get_sender_id()),
+            actor_name=str(event.get_sender_name()),
+        )
 
     def _is_group_chat(self, event: AstrMessageEvent) -> bool:
-        """判断是否为群聊消息"""
-        origin = event.unified_msg_origin or ""
-        # 群聊的unified_msg_origin通常包含group关键字
+        origin = str(event.unified_msg_origin or "")
         return "group" in origin.lower()
 
-    @filter.command("我的画像")
-    async def show_my_profile(self, event: AstrMessageEvent):
-        # 判断是否为群聊，如果是群聊则检查开关
-        if self._is_group_chat(event):
-            allow_in_group = self.config.get("allow_profile_in_group", False)
-            if not allow_in_group:
-                denied_msg = self.config.get("group_profile_denied_msg", "为保护隐私，请私聊我查看你的画像哦~")
-                yield event.plain_result(denied_msg)
-                return
+    def _is_ambiguous_identity(self, message_text: str, evidence: str) -> bool:
+        if not self._strict_identity_guard():
+            return False
+        merged_text = f"{message_text}\n{evidence}".lower()
+        mentions_third_party = any(marker.lower() in merged_text for marker in THIRD_PARTY_MARKERS)
+        mentions_self = any(marker in f"{message_text}{evidence}" for marker in FIRST_PERSON_MARKERS)
+        return mentions_third_party and not mentions_self
 
-        user_id = event.get_sender_id()
+    def _build_prompt(self, event: AstrMessageEvent) -> str:
+        sender_id = str(event.get_sender_id())
+        sender_name = str(event.get_sender_name())
         session_id = self._get_session_id(event)
+        profile_summary = self.store.format_profile_summary(sender_id, session_id)
+        field_catalog = self.store.format_field_catalog(sender_id, session_id)
+        custom_field_catalog = self.store.format_custom_field_catalog(sender_id, session_id)
+        prompt_template = self.config.get("profile_prompt_template") or self.config.get("profile_prompt") or DEFAULT_PROFILE_PROMPT_TEMPLATE
+        return prompt_template.format(
+            sender_id=sender_id,
+            sender_name=sender_name,
+            session_scope="当前会话隔离" if self.session_based else "全局共享",
+            profile_summary=profile_summary,
+            field_catalog=field_catalog,
+            custom_field_catalog=custom_field_catalog,
+            tool_names=", ".join([VIEW_TOOL_NAME, REMEMBER_TOOL_NAME, FORGET_TOOL_NAME]),
+        )
 
-        profile = self.manager.get_user_profile(user_id, session_id)
-        if not profile:
-            yield event.plain_result("暂时还没有记录内容，多和我聊聊吧")
+    def _validate_evidence(
+        self,
+        event: AstrMessageEvent,
+        evidence: str,
+        allowed_source_kinds: set[str],
+        source_kind: str,
+    ) -> str | None:
+        message_text = str(event.message_str or "").strip()
+        evidence_text = str(evidence or "").strip()
+        if source_kind not in allowed_source_kinds:
+            return "拒绝执行：source_kind 不在允许范围内。"
+        if not message_text:
+            return "拒绝执行：当前消息为空，无法校验画像依据。"
+        if not evidence_text:
+            return "拒绝执行：evidence 不能为空。"
+        if evidence_text not in message_text:
+            return "拒绝执行：evidence 必须直接来自当前用户本轮消息。"
+        if self._is_ambiguous_identity(message_text, evidence_text):
+            return "拒绝执行：当前消息同时提到其他人且缺少明确自述，容易写错对象。请先澄清，再决定是否记录。"
+        return None
+
+    def _ensure_known_or_creatable_field(
+        self,
+        *,
+        user_id: str,
+        session_id: str | None,
+        field_name: str,
+        create_custom_field: bool,
+        allow_custom_field: bool,
+    ) -> str | None:
+        if self.store.is_known_field(user_id, field_name, session_id):
+            return None
+        if create_custom_field and allow_custom_field:
+            return None
+        return "拒绝执行：字段不存在。请优先使用已有字段；如果确实需要新字段，请明确允许创建自定义字段。"
+
+    async def handle_llm_view(self, event: AstrMessageEvent) -> str:
+        user_id = str(event.get_sender_id())
+        session_id = self._get_session_id(event)
+        summary = self.store.format_profile_summary(user_id, session_id)
+        fields = self.store.format_field_catalog(user_id, session_id)
+        custom_fields = self.store.format_custom_field_catalog(user_id, session_id)
+        return (
+            f"当前用户画像摘要：\n{summary}\n\n"
+            f"可用字段：\n{fields}\n\n"
+            f"当前自定义字段：\n{custom_fields}\n\n"
+            "删除备注项时，可把字段写成 备注:序号，例如 备注:2。"
+        )
+
+    async def handle_llm_remember(
+        self,
+        event: AstrMessageEvent,
+        **kwargs: Any,
+    ) -> str:
+        if not self._llm_tools_enabled():
+            return "画像工具当前已关闭。"
+        field_name = str(kwargs.get("field_name") or "").strip()
+        value = str(kwargs.get("value") or "").strip()
+        evidence = str(kwargs.get("evidence") or "").strip()
+        source_kind = str(kwargs.get("source_kind") or "").strip()
+        create_custom_field = bool(kwargs.get("create_custom_field", False))
+        field_description = str(kwargs.get("field_description") or "").strip()
+
+        validation_error = self._validate_evidence(event, evidence, REMEMBER_SOURCE_KINDS, source_kind)
+        if validation_error:
+            return validation_error
+
+        user_id = str(event.get_sender_id())
+        session_id = self._get_session_id(event)
+        field_error = self._ensure_known_or_creatable_field(
+            user_id=user_id,
+            session_id=session_id,
+            field_name=field_name,
+            create_custom_field=create_custom_field,
+            allow_custom_field=self._allow_llm_custom_fields(),
+        )
+        if field_error:
+            return field_error
+
+        result = self.store.upsert_field(
+            user_id=user_id,
+            subject_name=str(event.get_sender_name()),
+            field_name=field_name,
+            value=value,
+            session_id=session_id,
+            actor=self._build_actor(event, "llm_tool"),
+            source_kind=source_kind,
+            evidence=evidence,
+            allow_custom_field=self._allow_llm_custom_fields() and create_custom_field,
+            field_description=field_description,
+        )
+        self._debug(f"LLM remember result for {user_id}: {result.message}")
+        return result.message
+
+    async def handle_llm_forget(
+        self,
+        event: AstrMessageEvent,
+        **kwargs: Any,
+    ) -> str:
+        if not self._llm_tools_enabled():
+            return "画像工具当前已关闭。"
+        field_selector = str(kwargs.get("field_selector") or "").strip()
+        evidence = str(kwargs.get("evidence") or "").strip()
+        source_kind = str(kwargs.get("source_kind") or "").strip()
+        validation_error = self._validate_evidence(event, evidence, FORGET_SOURCE_KINDS, source_kind)
+        if validation_error:
+            return validation_error
+
+        user_id = str(event.get_sender_id())
+        session_id = self._get_session_id(event)
+        result = self.store.delete_field(
+            user_id=user_id,
+            session_id=session_id,
+            field_selector=field_selector,
+            actor=self._build_actor(event, "llm_tool"),
+            source_kind=source_kind,
+            evidence=evidence,
+        )
+        self._debug(f"LLM forget result for {user_id}: {result.message}")
+        return result.message
+
+    @filter.on_llm_request()
+    async def inject_profile_context(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        prompt = self._build_prompt(event)
+        current_system_prompt = str(req.system_prompt or "").rstrip()
+        req.system_prompt = f"{current_system_prompt}\n\n{prompt}".strip()
+
+    @filter.command("我的画像")
+    async def show_my_profile(self, event: AstrMessageEvent) -> None:
+        if self._is_group_chat(event) and not bool(self.config.get("allow_profile_in_group", False)):
+            denied_msg = self.config.get(
+                "group_profile_denied_msg",
+                "画像内容可能涉及隐私，请私聊查看。",
+            )
+            yield event.plain_result(str(denied_msg))
             return
 
-        summary = self.manager.format_profile_summary(user_id, session_id)
-        last_updated = profile.get("_last_updated", "未知")
-        yield event.plain_result(f"📋 你的画像：\n{summary}\n\n最后更新：{last_updated}")
+        user_id = str(event.get_sender_id())
+        session_id = self._get_session_id(event)
+        summary = self.store.format_profile_summary(user_id, session_id)
+        if summary == "暂无记录":
+            yield event.plain_result("暂时还没有你的画像记录。")
+            return
+
+        last_updated = self.store.get_last_updated(user_id, session_id) or "未知"
+        yield event.plain_result(f"你的画像：\n{summary}\n\n最后更新：{last_updated}")
+
+    @filter.command("画像字段")
+    async def show_field_catalog(self, event: AstrMessageEvent) -> None:
+        user_id = str(event.get_sender_id())
+        session_id = self._get_session_id(event)
+        catalog = self.store.format_field_catalog(user_id, session_id)
+        yield event.plain_result(f"可用画像字段：\n{catalog}")
+
+    @filter.command("设置画像")
+    async def set_my_profile(self, event: AstrMessageEvent, field_name: str, value: str) -> None:
+        user_id = str(event.get_sender_id())
+        session_id = self._get_session_id(event)
+        allow_custom_field = self._allow_user_custom_fields()
+        result = self.store.upsert_field(
+            user_id=user_id,
+            subject_name=str(event.get_sender_name()),
+            field_name=field_name,
+            value=value,
+            session_id=session_id,
+            actor=self._build_actor(event, "user_command"),
+            source_kind="manual_edit",
+            evidence=str(event.message_str or ""),
+            allow_custom_field=allow_custom_field,
+            field_description="用户通过命令手动创建的自定义字段",
+        )
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
 
     @filter.command("删除画像")
-    async def delete_my_field(self, event: AstrMessageEvent, field: str):
-        user_id = event.get_sender_id()
-        session_id = self._get_session_id(event)
-
-        field = field.strip()
-
-        success, msg = self.manager.delete_field(user_id, field, session_id)
-        if success:
-            yield event.plain_result(f"✅ 已删除「{field}」")
-        else:
-            yield event.plain_result(f"❌ {msg}")
+    async def delete_my_profile(self, event: AstrMessageEvent, field_selector: str) -> None:
+        result = self.store.delete_field(
+            user_id=str(event.get_sender_id()),
+            session_id=self._get_session_id(event),
+            field_selector=field_selector,
+            actor=self._build_actor(event, "user_command"),
+            source_kind="manual_delete",
+            evidence=str(event.message_str or ""),
+        )
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
 
     @filter.command("清空画像")
-    async def clear_my_profile(self, event: AstrMessageEvent):
-        user_id = event.get_sender_id()
-        session_id = self._get_session_id(event)
+    async def clear_my_profile(self, event: AstrMessageEvent) -> None:
+        result = self.store.clear_profile(
+            user_id=str(event.get_sender_id()),
+            session_id=self._get_session_id(event),
+            actor=self._build_actor(event, "user_command"),
+        )
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
 
-        success = self.manager.clear_profile(user_id, session_id)
-        if success:
-            yield event.plain_result("✅ 已清空你的所有画像数据")
-        else:
-            yield event.plain_result("你还没有任何画像数据")
-
-    # ------------------- 管理员命令 -------------------
-
-    def _is_admin(self, event: AstrMessageEvent) -> bool:
-        return event.role == "admin"
-
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查询画像")
-    async def admin_query_profile(self, event: AstrMessageEvent, user_id: str):
-        if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", "错误：此命令仅限管理员使用。"))
-            return
-
+    async def admin_query_profile(self, event: AstrMessageEvent, user_id: str) -> None:
+        target_user_id = str(user_id).strip()
         session_id = self._get_session_id(event)
-        profile = self.manager.get_user_profile(user_id.strip(), session_id)
-
-        if not profile:
-            yield event.plain_result(f"用户 {user_id} 没有画像数据")
+        summary = self.store.format_profile_summary(target_user_id, session_id)
+        if summary == "暂无记录":
+            yield event.plain_result(f"用户 {target_user_id} 没有画像记录。")
             return
+        last_updated = self.store.get_last_updated(target_user_id, session_id) or "未知"
+        yield event.plain_result(
+            f"用户 {target_user_id} 的画像：\n{summary}\n\n最后更新：{last_updated}"
+        )
 
-        summary = self.manager.format_profile_summary(user_id.strip(), session_id)
-        last_updated = profile.get("_last_updated", "未知")
-        yield event.plain_result(f"📋 用户 {user_id} 的画像：\n{summary}\n\n最后更新：{last_updated}")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("修改画像")
+    async def admin_set_profile(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        field_name: str,
+        value: str,
+    ) -> None:
+        target_user_id = str(user_id).strip()
+        session_id = self._get_session_id(event)
+        old_profile = self.store.get_profile(target_user_id, session_id)
+        subject_name = str(old_profile.get("subject_name") or target_user_id)
+        result = self.store.upsert_field(
+            user_id=target_user_id,
+            subject_name=subject_name,
+            field_name=field_name,
+            value=value,
+            session_id=session_id,
+            actor=self._build_actor(event, "admin_command"),
+            source_kind="admin_edit",
+            evidence=str(event.message_str or ""),
+            allow_custom_field=True,
+            field_description="管理员通过命令创建的自定义字段",
+        )
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("删除画像字段")
+    async def admin_delete_profile_field(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        field_selector: str,
+    ) -> None:
+        result = self.store.delete_field(
+            user_id=str(user_id).strip(),
+            session_id=self._get_session_id(event),
+            field_selector=field_selector,
+            actor=self._build_actor(event, "admin_command"),
+            source_kind="admin_delete",
+            evidence=str(event.message_str or ""),
+        )
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("清空用户画像")
+    async def admin_clear_profile(self, event: AstrMessageEvent, user_id: str) -> None:
+        result = self.store.clear_profile(
+            user_id=str(user_id).strip(),
+            session_id=self._get_session_id(event),
+            actor=self._build_actor(event, "admin_command"),
+        )
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("画像审计")
+    async def admin_audit_profile(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        limit: int = 10,
+    ) -> None:
+        session_id = self._get_session_id(event)
+        entries = self.store.read_recent_audit(
+            user_id=str(user_id).strip(),
+            session_id=session_id,
+            limit=limit,
+        )
+        if not entries:
+            yield event.plain_result("没有找到审计记录。")
+            return
+        lines = []
+        for entry in entries:
+            lines.append(
+                f"- [{entry['at']}] {entry['action']} {entry['field_name']} "
+                f"by {entry['actor_type']}({entry['actor_name']}) | old={entry['old_value']} | new={entry['new_value']}"
+            )
+        yield event.plain_result("最近画像审计：\n" + "\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("画像统计")
-    async def admin_profile_stats(self, event: AstrMessageEvent):
-        if not self._is_admin(event):
-            yield event.plain_result(self.config.get("admin_permission_denied_msg", "错误：此命令仅限管理员使用。"))
-            return
+    async def admin_profile_stats(self, event: AstrMessageEvent) -> None:
+        stats = self.store.collect_stats()
+        user_count = int(stats["user_count"])
+        field_counts = stats["field_counts"]
+        custom_field_counts = stats["custom_field_counts"]
 
-        all_profiles = self.manager.export_all_profiles()
-        user_count = len(all_profiles)
+        lines = [f"画像用户数：{user_count}", "", "字段覆盖率："]
+        for field_name in self.store.builtin_field_map:
+            count = int(field_counts.get(field_name, 0))
+            ratio = (count / user_count * 100) if user_count else 0.0
+            lines.append(f"- {field_name}：{count} ({ratio:.1f}%)")
 
-        field_counts = {}
-        for profile in all_profiles.values():
-            for field in profile:
-                if not field.startswith("_"):
-                    field_counts[field] = field_counts.get(field, 0) + 1
+        if custom_field_counts:
+            lines.extend(["", "自定义字段使用情况："])
+            for field_name, count in sorted(custom_field_counts.items(), key=lambda item: (-item[1], item[0])):
+                lines.append(f"- {field_name}：{count}")
 
-        response = f"📊 画像系统统计\n\n总用户数：{user_count}\n\n字段填充情况：\n"
+        yield event.plain_result("\n".join(lines))
 
-        for field in self.manager.allowed_fields:
-            count = field_counts.get(field, 0)
-            rate = (count / user_count * 100) if user_count > 0 else 0
-            response += f"• {field}: {count} ({rate:.1f}%)\n"
-
-        yield event.plain_result(response)
-
-    async def terminate(self):
-        self.manager._save_data()
+    async def terminate(self) -> None:
+        self._debug("terminate called")
