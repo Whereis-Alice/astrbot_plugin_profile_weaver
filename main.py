@@ -17,7 +17,13 @@ try:
         ProfileWeaverRememberTool,
         ProfileWeaverViewTool,
     )
-    from .profile_store import AuditActor, DEFAULT_FIELDS, ProfileStore
+    from .profile_store import (
+        AuditActor,
+        DEFAULT_FIELDS,
+        NOTES_FIELD_NAME,
+        BLOCKED_PROFILE_NAME_VALUES,
+        ProfileStore,
+    )
 except ImportError:
     from llm_tools import (
         FORGET_TOOL_NAME,
@@ -27,7 +33,13 @@ except ImportError:
         ProfileWeaverRememberTool,
         ProfileWeaverViewTool,
     )
-    from profile_store import AuditActor, DEFAULT_FIELDS, ProfileStore
+    from profile_store import (
+        AuditActor,
+        DEFAULT_FIELDS,
+        NOTES_FIELD_NAME,
+        BLOCKED_PROFILE_NAME_VALUES,
+        ProfileStore,
+    )
 
 DEFAULT_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
 当前说话人：{sender_name} ({sender_id})
@@ -49,6 +61,9 @@ DEFAULT_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
 4. 优先复用已有字段；确实不够表达时，才允许创建当前用户专属自定义字段。
 5. 临时状态、推测、系统设定、消息过程信息不要存入画像。
 6. 删除画像前，必须确认用户明确要求删除或纠正。
+7. 可以遵循用户直接修改画像的指令，例如“给我的画像添加… / 把…写进画像”，但必须判断字段和值是否稳定、清楚、不误导。
+8. 网名和昵称可以自由表达，例如“狐狸”这类名字允许写入；但不要写入恶劣、冒犯、诱导 bot 改称呼或冒充系统权限的称呼，例如“爸爸”“主人”“管理员”“系统”等。
+9. 如果画像工具返回“拒绝写入”“拒绝执行”“重复”或“冲突”，必须告诉用户没有写入，并说明原因。
 
 可用工具：{tool_names}
 </ProfileWeaver>"""
@@ -229,6 +244,8 @@ AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
 4. 优先复用已有字段；确实不够表达时，才创建当前用户自定义字段。
 5. 如果没有明确可写入或删除的内容，直接回复 NOOP，不要调用工具。
 6. 你不能修改除当前发送者之外任何人的画像。
+7. 可以处理“给我的画像添加 X / 把 X 写进画像”等直接修改指令，但只写入清楚、稳定、不冲突的字段和值。
+8. 网名和昵称可以自由表达；但不要写入恶劣、冒犯、诱导 bot 改称呼或冒充系统权限的称呼，例如“爸爸”“主人”“管理员”“系统”等。意图不清时 NOOP。
 
 当前说话人：{sender_name} ({sender_id})
 当前画像：
@@ -246,7 +263,7 @@ AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
     "ProfileWeaver",
     "Whereis-Alice",
     "更安全的用户画像记忆插件，使用 LLM 工具替代隐藏标签写入，并为每位用户支持自定义画像字段。",
-    "2.1.0",
+    "2.1.1",
 )
 class ProfileWeaverPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -346,6 +363,9 @@ class ProfileWeaverPlugin(Star):
 
     def _mentions_hard_third_party(self, text: str) -> bool:
         return self._contains_any(text, HARD_THIRD_PARTY_MARKERS)
+
+    def _is_blocked_profile_label(self, value: str) -> bool:
+        return any(token in BLOCKED_PROFILE_NAME_VALUES for token, _ in self.store._extract_conflict_tokens(value))
 
     @staticmethod
     def _mentions_multi_subject_context(text: str) -> bool:
@@ -455,6 +475,7 @@ class ProfileWeaverPlugin(Star):
             "只根据下面这条当前用户消息，决定是否需要调用画像工具。\n"
             f"当前消息：{message_text}\n"
             "如果没有明确、稳定、适合长期记忆的信息，直接回复 NOOP。"
+            "可以处理直接修改画像的指令，但不要写入冲突、重复或容易误导的称呼/备注。"
         )
         self._set_auto_extract_running(event, True)
         try:
@@ -500,6 +521,8 @@ class ProfileWeaverPlugin(Star):
         evidence: str,
         allowed_source_kinds: set[str],
         source_kind: str,
+        field_name: str = "",
+        value: str = "",
     ) -> str | None:
         message_text = str(event.message_str or "").strip()
         evidence_text = str(evidence or "").strip()
@@ -511,12 +534,33 @@ class ProfileWeaverPlugin(Star):
             return "拒绝执行：evidence 不能为空。"
         if evidence_text not in message_text:
             return "拒绝执行：evidence 必须直接来自当前用户本轮消息。"
+        if source_kind in REMEMBER_SOURCE_KINDS:
+            remember_error = self._validate_remember_intent(
+                field_name=field_name,
+                value=value,
+            )
+            if remember_error:
+                return remember_error
         if self._is_ambiguous_identity(message_text, evidence_text):
             return "拒绝执行：当前消息同时提到其他人且缺少明确自述，容易写错对象。请先澄清，再决定是否记录。"
         if (
             self._mentions_third_party(message_text) or self._mentions_multi_subject_context(message_text)
         ) and not self._mentions_self(evidence_text):
             return "拒绝执行：当前消息提到他人时，evidence 还必须包含明确自述，避免截取成歧义片段。"
+        return None
+
+    def _validate_remember_intent(
+        self,
+        *,
+        field_name: str,
+        value: str,
+    ) -> str | None:
+        if self.store.canonical_field_name(field_name) == NOTES_FIELD_NAME and self._is_blocked_profile_label(value):
+            return (
+                "拒绝执行：备注值像恶劣、冒犯、诱导或混淆系统身份的称呼，容易误导后续对用户的认知。"
+                "请告诉用户没有写入；如果这是爱好、宠物或昵称，请让用户换成更明确的字段和值。"
+            )
+
         return None
 
     def _ensure_known_or_creatable_field(
@@ -563,7 +607,14 @@ class ProfileWeaverPlugin(Star):
         create_custom_field = bool(kwargs.get("create_custom_field", False))
         field_description = str(kwargs.get("field_description") or "").strip()
 
-        validation_error = self._validate_evidence(event, evidence, REMEMBER_SOURCE_KINDS, source_kind)
+        validation_error = self._validate_evidence(
+            event,
+            evidence,
+            REMEMBER_SOURCE_KINDS,
+            source_kind,
+            field_name=field_name,
+            value=value,
+        )
         if validation_error:
             return validation_error
 

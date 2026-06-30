@@ -12,6 +12,16 @@ from astrbot.api import logger
 
 NOTES_FIELD_NAME = "备注"
 LEGACY_PLUGIN_DIR_NAMES = ("astrbot_plugin_soulmap", "SoulMap", "soulmap")
+CANONICAL_FIELD_ALIASES = {
+    "称呼": "昵称",
+    "对用户的称呼": "昵称",
+    "名字": "昵称",
+    "姓名": "昵称",
+}
+PROFILE_NAME_FIELD_NAMES = ("昵称", "对用户的称呼", "称呼", "名字", "姓名", "别名", "网名", "用户名")
+PROFILE_NAME_FIELD_NAME_SET = {re.sub(r"\s+", " ", name.strip()) for name in PROFILE_NAME_FIELD_NAMES}
+PROFILE_CONFLICT_SPLIT_PATTERN = re.compile(r"[、,，/|;；\n]+")
+PROFILE_CONFLICT_STRIP_CHARS = " \t\r\n\"'“”‘’`[]()（）【】<>《》:："
 
 DEFAULT_FIELDS: list[tuple[str, str]] = [
     ("昵称", "用户希望被如何称呼"),
@@ -51,6 +61,20 @@ FORBIDDEN_FIELD_FRAGMENTS = (
     "群友",
     "聊天记录",
     "管理员口令",
+)
+BLOCKED_PROFILE_NAME_VALUES = (
+    "爸爸",
+    "爹",
+    "爹地",
+    "义父",
+    "主人",
+    "master",
+    "owner",
+    "系统",
+    "system",
+    "assistant",
+    "管理员",
+    "群主",
 )
 
 
@@ -99,10 +123,129 @@ class ProfileStore:
     def normalize_field_name(field_name: str) -> str:
         return re.sub(r"\s+", " ", str(field_name or "").strip())
 
+    @classmethod
+    def canonical_field_name(cls, field_name: str) -> str:
+        normalized = cls.normalize_field_name(field_name)
+        return CANONICAL_FIELD_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _normalize_conflict_token(value: Any) -> str:
+        text = str(value or "").strip(PROFILE_CONFLICT_STRIP_CHARS)
+        text = re.sub(r"\s+", "", text)
+        return text.casefold()
+
+    def _extract_conflict_tokens(self, raw_value: Any) -> list[tuple[str, str]]:
+        if isinstance(raw_value, list):
+            source_items = raw_value
+        else:
+            source_items = PROFILE_CONFLICT_SPLIT_PATTERN.split(str(raw_value or ""))
+
+        tokens: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in source_items:
+            display_text = str(item or "").strip(PROFILE_CONFLICT_STRIP_CHARS)
+            token = self._normalize_conflict_token(display_text)
+            if len(token) < 2 or token in seen:
+                continue
+            seen.add(token)
+            tokens.append((token, display_text))
+        return tokens
+
+    def _is_profile_name_field(self, field_name: str) -> bool:
+        normalized = self.normalize_field_name(field_name)
+        return normalized in PROFILE_NAME_FIELD_NAME_SET
+
+    def _profile_label(self, session_key: str, record: dict[str, Any]) -> str:
+        subject_name = str(record.get("subject_name") or "").strip()
+        subject_user_id = str(record.get("subject_user_id") or self._extract_user_id_from_key(session_key)).strip()
+        if subject_name:
+            return f"{subject_name}({subject_user_id})"
+        return subject_user_id
+
+    def _iter_profile_name_tokens(self) -> list[tuple[str, str, str, str, str]]:
+        matches: list[tuple[str, str, str, str, str]] = []
+        for session_key, record in self.profiles.items():
+            if not isinstance(record, dict):
+                continue
+            fields = record.get("fields", {})
+            if not isinstance(fields, dict):
+                continue
+            for field_name, value in fields.items():
+                if not self._is_profile_name_field(field_name):
+                    continue
+                for token, display_text in self._extract_conflict_tokens(value):
+                    matches.append((token, display_text, session_key, field_name, self._profile_label(session_key, record)))
+        return matches
+
+    def _iter_profile_note_tokens(self) -> list[tuple[str, str, str, str]]:
+        matches: list[tuple[str, str, str, str]] = []
+        for session_key, record in self.profiles.items():
+            if not isinstance(record, dict):
+                continue
+            fields = record.get("fields", {})
+            if not isinstance(fields, dict):
+                continue
+            for token, display_text in self._extract_conflict_tokens(fields.get(NOTES_FIELD_NAME, [])):
+                matches.append((token, display_text, session_key, self._profile_label(session_key, record)))
+        return matches
+
+    def _validate_profile_identity_conflicts(
+        self,
+        *,
+        session_key: str,
+        record: dict[str, Any],
+        field_name: str,
+        value: str,
+    ) -> OperationResult:
+        candidate_tokens = self._extract_conflict_tokens(value)
+        if not candidate_tokens:
+            return OperationResult(True, "画像身份冲突检查通过")
+
+        normalized_field = self.normalize_field_name(field_name)
+        is_name_field = self._is_profile_name_field(normalized_field)
+
+        if is_name_field:
+            for token, display_text in candidate_tokens:
+                if token in BLOCKED_PROFILE_NAME_VALUES:
+                    return OperationResult(
+                        False,
+                        f"拒绝写入：称呼/名字「{display_text}」属于容易冒犯、诱导或混淆系统身份的称呼。请向用户说明没有写入，并请用户换一个更合适的称呼。",
+                    )
+                for existing_token, existing_text, existing_key, existing_field, owner_label in self._iter_profile_name_tokens():
+                    if token != existing_token:
+                        continue
+                    if existing_key == session_key and self.normalize_field_name(existing_field) == normalized_field:
+                        continue
+                    return OperationResult(
+                        False,
+                        f"拒绝写入：称呼/名字「{display_text}」与 {owner_label} 的「{existing_field}：{existing_text}」重复，可能导致画像混淆。请向用户说明没有写入，并请用户换一个更明确的称呼。",
+                    )
+                for note_token, note_text, _, owner_label in self._iter_profile_note_tokens():
+                    if token != note_token:
+                        continue
+                    return OperationResult(
+                        False,
+                        f"拒绝写入：称呼/名字「{display_text}」与 {owner_label} 的备注「{note_text}」重复，名字和备注不能互相复用。请向用户说明没有写入。",
+                    )
+            return OperationResult(True, "画像身份冲突检查通过")
+
+        if normalized_field == NOTES_FIELD_NAME:
+            name_tokens = self._iter_profile_name_tokens()
+            for token, display_text in candidate_tokens:
+                for name_token, name_text, _, name_field, owner_label in name_tokens:
+                    if token != name_token:
+                        continue
+                    return OperationResult(
+                        False,
+                        f"拒绝写入：备注「{display_text}」与 {owner_label} 的「{name_field}：{name_text}」重复，名字和备注不能互相复用。请向用户说明没有写入。",
+                    )
+
+        return OperationResult(True, "画像身份冲突检查通过")
+
     def _build_builtin_field_map(self, builtin_fields: list[str]) -> dict[str, str]:
         result: dict[str, str] = {}
         for raw_name in builtin_fields:
-            field_name = self.normalize_field_name(raw_name)
+            field_name = self.canonical_field_name(raw_name)
             if not field_name:
                 continue
             result[field_name] = DEFAULT_FIELD_DESCRIPTIONS.get(field_name, "基础画像字段")
@@ -483,7 +626,7 @@ class ProfileStore:
             for raw_field_name, raw_value in payload.items():
                 if str(raw_field_name).startswith("_"):
                     continue
-                field_name = self.normalize_field_name(raw_field_name)
+                field_name = self.canonical_field_name(raw_field_name)
                 if not field_name:
                     continue
                 if field_name == NOTES_FIELD_NAME:
@@ -526,7 +669,7 @@ class ProfileStore:
 
         fields: dict[str, Any] = {}
         for raw_field_name, raw_value in fields_payload.items():
-            field_name = self.normalize_field_name(raw_field_name)
+            field_name = self.canonical_field_name(raw_field_name)
             if not field_name:
                 continue
             if field_name == NOTES_FIELD_NAME:
@@ -540,8 +683,10 @@ class ProfileStore:
 
         custom_fields: dict[str, Any] = {}
         for raw_field_name, raw_metadata in custom_fields_payload.items():
-            field_name = self.normalize_field_name(raw_field_name)
+            field_name = self.canonical_field_name(raw_field_name)
             if not field_name or not isinstance(raw_metadata, dict):
+                continue
+            if field_name in self.builtin_field_map:
                 continue
             custom_fields[field_name] = {
                 "description": str(raw_metadata.get("description") or "").strip(),
@@ -551,7 +696,7 @@ class ProfileStore:
 
         field_meta: dict[str, Any] = {}
         for raw_field_name, raw_metadata in field_meta_payload.items():
-            field_name = self.normalize_field_name(raw_field_name)
+            field_name = self.canonical_field_name(raw_field_name)
             if not field_name or not isinstance(raw_metadata, dict):
                 continue
             field_meta[field_name] = self._normalize_field_meta_entry(raw_metadata, updated_at)
@@ -688,7 +833,7 @@ class ProfileStore:
         return "\n".join(lines) if lines else "暂无记录"
 
     def is_known_field(self, user_id: str, field_name: str, session_id: str | None = None) -> bool:
-        normalized = self.normalize_field_name(field_name)
+        normalized = self.canonical_field_name(field_name)
         if normalized in self.builtin_field_map:
             return True
         profile = self.get_profile(user_id, session_id)
@@ -781,7 +926,7 @@ class ProfileStore:
         allow_custom_field: bool,
         field_description: str = "",
     ) -> OperationResult:
-        normalized_field = self.normalize_field_name(field_name)
+        normalized_field = self.canonical_field_name(field_name)
         value_text = str(value or "").strip()
         if not normalized_field:
             return OperationResult(False, "字段名不能为空")
@@ -793,6 +938,7 @@ class ProfileStore:
         fields = record["fields"]
         custom_fields = record["custom_fields"]
         created_custom_field = False
+        session_key = self._profile_key(user_id, session_id)
 
         if normalized_field not in self.builtin_field_map and normalized_field not in custom_fields:
             if not allow_custom_field:
@@ -809,6 +955,17 @@ class ProfileStore:
                 "created_by": actor.actor_type,
             }
             created_custom_field = True
+
+        conflict_validation = self._validate_profile_identity_conflicts(
+            session_key=session_key,
+            record=record,
+            field_name=normalized_field,
+            value=value_text,
+        )
+        if not conflict_validation.ok:
+            if created_custom_field:
+                custom_fields.pop(normalized_field, None)
+            return conflict_validation
 
         old_value = fields.get(normalized_field)
         if normalized_field == NOTES_FIELD_NAME:
@@ -859,7 +1016,7 @@ class ProfileStore:
         if not record:
             return OperationResult(False, "没有找到对应画像")
 
-        normalized_selector = self.normalize_field_name(field_selector)
+        normalized_selector = self.canonical_field_name(field_selector)
         notes = record["fields"].get(NOTES_FIELD_NAME, [])
         note_match = NOTE_INDEX_PATTERN.fullmatch(normalized_selector)
         if note_match and isinstance(notes, list) and notes:
