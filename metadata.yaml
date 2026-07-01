@@ -2,7 +2,7 @@ name: astrbot_plugin_profile_weaver
 display_name: 画像织谱
 desc: 更安全的用户画像记忆插件，使用 LLM 工具显式维护当前说话人的画像，并支持每用户自定义字段。
 help: 用户命令：我的画像、画像字段、设置画像、删除画像、清空画像；管理员命令：查询画像、修改画像、删除画像字段、清空用户画像、画像审计、画像统计
-version: v2.1.1
+version: v2.1.2
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_profile_weaver
 astrbot_version: ">=4.16,<5"

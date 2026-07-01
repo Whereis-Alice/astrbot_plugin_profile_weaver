@@ -162,10 +162,21 @@ class ProfileStore:
             return f"{subject_name}({subject_user_id})"
         return subject_user_id
 
-    def _iter_profile_name_tokens(self) -> list[tuple[str, str, str, str, str]]:
+    def _profile_in_session_scope(
+        self,
+        session_key: str,
+        record: dict[str, Any],
+        session_id: str | None,
+    ) -> bool:
+        subject_user_id = str(record.get("subject_user_id") or self._extract_user_id_from_key(session_key)).strip()
+        return session_key == self._profile_key(subject_user_id, session_id)
+
+    def _iter_profile_name_tokens(self, session_id: str | None) -> list[tuple[str, str, str, str, str]]:
         matches: list[tuple[str, str, str, str, str]] = []
         for session_key, record in self.profiles.items():
             if not isinstance(record, dict):
+                continue
+            if not self._profile_in_session_scope(session_key, record, session_id):
                 continue
             fields = record.get("fields", {})
             if not isinstance(fields, dict):
@@ -177,10 +188,12 @@ class ProfileStore:
                     matches.append((token, display_text, session_key, field_name, self._profile_label(session_key, record)))
         return matches
 
-    def _iter_profile_note_tokens(self) -> list[tuple[str, str, str, str]]:
+    def _iter_profile_note_tokens(self, session_id: str | None) -> list[tuple[str, str, str, str]]:
         matches: list[tuple[str, str, str, str]] = []
         for session_key, record in self.profiles.items():
             if not isinstance(record, dict):
+                continue
+            if not self._profile_in_session_scope(session_key, record, session_id):
                 continue
             fields = record.get("fields", {})
             if not isinstance(fields, dict):
@@ -193,6 +206,7 @@ class ProfileStore:
         self,
         *,
         session_key: str,
+        session_id: str | None,
         record: dict[str, Any],
         field_name: str,
         value: str,
@@ -211,7 +225,7 @@ class ProfileStore:
                         False,
                         f"拒绝写入：称呼/名字「{display_text}」属于容易冒犯、诱导或混淆系统身份的称呼。请向用户说明没有写入，并请用户换一个更合适的称呼。",
                     )
-                for existing_token, existing_text, existing_key, existing_field, owner_label in self._iter_profile_name_tokens():
+                for existing_token, existing_text, existing_key, existing_field, owner_label in self._iter_profile_name_tokens(session_id):
                     if token != existing_token:
                         continue
                     if existing_key == session_key and self.normalize_field_name(existing_field) == normalized_field:
@@ -220,7 +234,7 @@ class ProfileStore:
                         False,
                         f"拒绝写入：称呼/名字「{display_text}」与 {owner_label} 的「{existing_field}：{existing_text}」重复，可能导致画像混淆。请向用户说明没有写入，并请用户换一个更明确的称呼。",
                     )
-                for note_token, note_text, _, owner_label in self._iter_profile_note_tokens():
+                for note_token, note_text, _, owner_label in self._iter_profile_note_tokens(session_id):
                     if token != note_token:
                         continue
                     return OperationResult(
@@ -230,7 +244,7 @@ class ProfileStore:
             return OperationResult(True, "画像身份冲突检查通过")
 
         if normalized_field == NOTES_FIELD_NAME:
-            name_tokens = self._iter_profile_name_tokens()
+            name_tokens = self._iter_profile_name_tokens(session_id)
             for token, display_text in candidate_tokens:
                 for name_token, name_text, _, name_field, owner_label in name_tokens:
                     if token != name_token:
@@ -958,6 +972,7 @@ class ProfileStore:
 
         conflict_validation = self._validate_profile_identity_conflicts(
             session_key=session_key,
+            session_id=session_id,
             record=record,
             field_name=normalized_field,
             value=value_text,
@@ -965,6 +980,7 @@ class ProfileStore:
         if not conflict_validation.ok:
             if created_custom_field:
                 custom_fields.pop(normalized_field, None)
+            self._drop_profile_if_empty(session_key)
             return conflict_validation
 
         old_value = fields.get(normalized_field)
