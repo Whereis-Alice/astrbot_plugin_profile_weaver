@@ -58,7 +58,7 @@ DEFAULT_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
 1. 这些画像只属于当前消息发送者，不属于你自己，也不属于别的群友。
 2. 只有当前发送者明确谈论自己、表达稳定偏好、或纠正自己的信息时，才允许调用画像写入工具。
 3. 当前消息提到其他人、转述他人、开玩笑、角色扮演、引用历史聊天、或信息不确定时，不要写入画像。
-4. 优先复用已有字段；确实不够表达时，才允许创建当前用户专属自定义字段。
+4. 优先复用已有字段；确实不够表达时，才允许创建当前用户专属自定义字段，例如“最喜欢的国漫”“常用编辑器”“追番偏好”。
 5. 临时状态、推测、系统设定、消息过程信息不要存入画像。
 6. 删除画像前，必须确认用户明确要求删除或纠正。
 7. 可以遵循用户直接修改画像的指令，例如“给我的画像添加… / 把…写进画像”，但必须判断字段和值是否稳定、清楚、不误导。
@@ -137,6 +137,7 @@ STRONG_SELF_MARKERS = (
     "本人",
 )
 PROFILE_SIGNAL_MARKERS = (
+    "我的",
     "叫我",
     "称呼我",
     "昵称",
@@ -233,6 +234,36 @@ AMBIGUOUS_MULTI_SUBJECT_PATTERNS = (
     re.compile(r"和我[^，。！？\s]{1,12}"),
     re.compile(r"跟我[^，。！？\s]{1,12}"),
 )
+DIRECT_AUTO_FIELD_PATTERN = r"(?P<field>[\u4e00-\u9fffA-Za-z0-9_\-/ ]{1,16}?)"
+DIRECT_AUTO_VALUE_PATTERN = r"(?P<value>[^，。！？!?；;\n]{1,120})"
+DIRECT_AUTO_PROFILE_PATTERNS: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (re.compile(rf"^我最喜欢的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "最喜欢的{field}", "self_preference"),
+    (re.compile(rf"^我最爱的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "最爱的{field}", "self_preference"),
+    (re.compile(rf"^我喜欢的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "喜欢的{field}", "self_preference"),
+    (re.compile(rf"^我爱看的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "爱看的{field}", "self_preference"),
+    (re.compile(rf"^我常看的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "常看的{field}", "self_preference"),
+    (re.compile(rf"^我常玩的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "常玩的{field}", "self_preference"),
+    (re.compile(rf"^我常用的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "常用的{field}", "self_preference"),
+    (re.compile(rf"^我的{DIRECT_AUTO_FIELD_PATTERN}\s*(?:[:：=]|是|为)\s*{DIRECT_AUTO_VALUE_PATTERN}$"), "{field}", "self_report"),
+)
+DIRECT_AUTO_FIELD_DENY_FRAGMENTS = (
+    "@",
+    "朋友",
+    "群友",
+    "别人",
+    "他",
+    "她",
+    "父母",
+    "妈妈",
+    "爸爸",
+    "同学",
+    "老师",
+    "系统",
+    "提示词",
+    "消息",
+    "聊天记录",
+)
+DIRECT_AUTO_VALUE_STRIP_CHARS = " \t\r\n\"'“”‘’`。！？!?；;"
 AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
 你是 ProfileWeaver 的后台画像抽取器。
 你的唯一任务：只依据“当前用户本轮消息”，决定是否为当前消息发送者调用画像工具。
@@ -246,6 +277,7 @@ AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
 6. 你不能修改除当前发送者之外任何人的画像。
 7. 可以处理“给我的画像添加 X / 把 X 写进画像”等直接修改指令，但只写入清楚、稳定、不冲突的字段和值。
 8. 网名和昵称可以自由表达；但不要写入恶劣、冒犯、诱导 bot 改称呼或冒充系统权限的称呼，例如“爸爸”“主人”“管理员”“系统”等。意图不清时 NOOP。
+9. 对“我最喜欢的国漫：凡人修仙传”这类明确自述偏好，如果已有字段不合适，应创建当前用户自定义字段，例如字段“最喜欢的国漫”、值“凡人修仙传”。
 
 当前说话人：{sender_name} ({sender_id})
 当前画像：
@@ -263,7 +295,7 @@ AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
     "ProfileWeaver",
     "Whereis-Alice",
     "更安全的用户画像记忆插件，使用 LLM 工具替代隐藏标签写入，并为每位用户支持自定义画像字段。",
-    "2.1.2",
+    "2.1.3",
 )
 class ProfileWeaverPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -436,6 +468,65 @@ class ProfileWeaverPlugin(Star):
         if self._mentions_third_party(stripped):
             return False
         return self._starts_with_any(stripped, PRIVATE_PROFILE_PREFIXES)
+
+    def _parse_direct_auto_profile_update(self, message_text: str) -> tuple[str, str, str] | None:
+        stripped = str(message_text or "").strip()
+        if not stripped or self._mentions_hard_third_party(stripped) or self._mentions_multi_subject_context(stripped):
+            return None
+
+        for pattern, field_template, source_kind in DIRECT_AUTO_PROFILE_PATTERNS:
+            match = pattern.fullmatch(stripped)
+            if not match:
+                continue
+
+            raw_field = str(match.group("field") or "").strip(DIRECT_AUTO_VALUE_STRIP_CHARS)
+            value = str(match.group("value") or "").strip(DIRECT_AUTO_VALUE_STRIP_CHARS)
+            field_name = field_template.format(field=raw_field).strip(DIRECT_AUTO_VALUE_STRIP_CHARS)
+            field_name = re.sub(r"\s+", " ", field_name).strip()
+            value = re.sub(r"\s+", " ", value).strip()
+            if not field_name or not value:
+                return None
+            if any(fragment in field_name for fragment in DIRECT_AUTO_FIELD_DENY_FRAGMENTS):
+                return None
+            if self._mentions_third_party(value):
+                return None
+            return field_name, value, source_kind
+
+        return None
+
+    def _try_direct_auto_extract_profile(self, event: AstrMessageEvent, message_text: str) -> bool:
+        parsed = self._parse_direct_auto_profile_update(message_text)
+        if not parsed:
+            return False
+
+        field_name, value, source_kind = parsed
+        remember_error = self._validate_remember_intent(field_name=field_name, value=value)
+        if remember_error:
+            self._debug(f"direct auto extraction rejected: {remember_error}")
+            return True
+
+        user_id = str(event.get_sender_id())
+        session_id = self._get_session_id(event)
+        is_known_field = self.store.is_known_field(user_id, field_name, session_id)
+        allow_custom_field = self._allow_llm_custom_fields() and not is_known_field
+        if not is_known_field and not allow_custom_field:
+            self._debug(f"direct auto extraction skipped: custom field disabled for {field_name}")
+            return False
+
+        result = self.store.upsert_field(
+            user_id=user_id,
+            subject_name=str(event.get_sender_name()),
+            field_name=field_name,
+            value=value,
+            session_id=session_id,
+            actor=self._build_actor(event, "auto_extract"),
+            source_kind=source_kind,
+            evidence=str(message_text or "").strip(),
+            allow_custom_field=allow_custom_field,
+            field_description="从当前用户明确自述中自动创建的自定义字段",
+        )
+        self._debug(f"direct auto extraction result for {user_id}: {result.message}")
+        return True
 
     def _build_auto_extract_system_prompt(self, event: AstrMessageEvent) -> str:
         sender_id = str(event.get_sender_id())
@@ -620,11 +711,15 @@ class ProfileWeaverPlugin(Star):
 
         user_id = str(event.get_sender_id())
         session_id = self._get_session_id(event)
+        field_is_known = self.store.is_known_field(user_id, field_name, session_id)
+        effective_create_custom_field = create_custom_field or (
+            self._allow_llm_custom_fields() and not field_is_known
+        )
         field_error = self._ensure_known_or_creatable_field(
             user_id=user_id,
             session_id=session_id,
             field_name=field_name,
-            create_custom_field=create_custom_field,
+            create_custom_field=effective_create_custom_field,
             allow_custom_field=self._allow_llm_custom_fields(),
         )
         if field_error:
@@ -639,7 +734,7 @@ class ProfileWeaverPlugin(Star):
             actor=self._build_actor(event, "llm_tool"),
             source_kind=source_kind,
             evidence=evidence,
-            allow_custom_field=self._allow_llm_custom_fields() and create_custom_field,
+            allow_custom_field=self._allow_llm_custom_fields() and effective_create_custom_field,
             field_description=field_description,
         )
         self._debug(f"LLM remember result for {user_id}: {result.message}")
@@ -698,6 +793,9 @@ class ProfileWeaverPlugin(Star):
 
         message_text = str(event.message_str or "").strip()
         if not self._is_profile_candidate_message(event, message_text):
+            return
+
+        if self._try_direct_auto_extract_profile(event, message_text):
             return
 
         self._debug(f"trigger proactive extraction for sender {event.get_sender_id()}")

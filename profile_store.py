@@ -262,9 +262,10 @@ class ProfileStore:
             field_name = self.canonical_field_name(raw_name)
             if not field_name:
                 continue
+            if field_name == NOTES_FIELD_NAME:
+                continue
             result[field_name] = DEFAULT_FIELD_DESCRIPTIONS.get(field_name, "基础画像字段")
-        if NOTES_FIELD_NAME not in result:
-            result[NOTES_FIELD_NAME] = DEFAULT_FIELD_DESCRIPTIONS[NOTES_FIELD_NAME]
+        result[NOTES_FIELD_NAME] = DEFAULT_FIELD_DESCRIPTIONS[NOTES_FIELD_NAME]
         return result
 
     def _read_json(self, path: Path) -> dict[str, Any]:
@@ -774,6 +775,8 @@ class ProfileStore:
         custom_fields = profile.get("custom_fields", {}) if profile else {}
         field_defs: list[dict[str, Any]] = []
         for field_name, description in self.builtin_field_map.items():
+            if field_name == NOTES_FIELD_NAME:
+                continue
             field_defs.append(
                 {
                     "name": field_name,
@@ -789,6 +792,13 @@ class ProfileStore:
                     "is_custom": True,
                 }
             )
+        field_defs.append(
+            {
+                "name": NOTES_FIELD_NAME,
+                "description": self.builtin_field_map[NOTES_FIELD_NAME],
+                "is_custom": False,
+            }
+        )
         return field_defs
 
     def format_field_catalog(self, user_id: str, session_id: str | None = None) -> str:
@@ -829,20 +839,25 @@ class ProfileStore:
 
         lines: list[str] = []
         for field_name in self.builtin_field_map:
+            if field_name == NOTES_FIELD_NAME:
+                continue
             if field_name not in fields:
                 continue
             value = fields[field_name]
-            if field_name == NOTES_FIELD_NAME and isinstance(value, list):
-                notes_text = " ".join(f"{idx}.{note}" for idx, note in enumerate(value, start=1))
-                lines.append(f"- {field_name}：{notes_text}")
-            else:
-                lines.append(f"- {field_name}：{value}")
+            lines.append(f"- {field_name}：{value}")
 
         custom_fields = profile.get("custom_fields", {})
         for field_name in custom_fields:
             if field_name not in fields:
                 continue
             lines.append(f"- {field_name}：{fields[field_name]}")
+
+        notes = fields.get(NOTES_FIELD_NAME)
+        if isinstance(notes, list) and notes:
+            notes_text = " ".join(f"{idx}.{note}" for idx, note in enumerate(notes, start=1))
+            lines.append(f"- {NOTES_FIELD_NAME}：{notes_text}")
+        elif notes:
+            lines.append(f"- {NOTES_FIELD_NAME}：{notes}")
 
         return "\n".join(lines) if lines else "暂无记录"
 
