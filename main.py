@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from astrbot.api import AstrBotConfig, ToolSet, logger
+from astrbot.api import message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
@@ -264,6 +265,8 @@ DIRECT_AUTO_FIELD_DENY_FRAGMENTS = (
     "聊天记录",
 )
 DIRECT_AUTO_VALUE_STRIP_CHARS = " \t\r\n\"'“”‘’`。！？!?；;"
+CQ_AT_USER_ID_PATTERN = re.compile(r"\[CQ:at,qq=(\d+)(?:,[^\]]*)?\]")
+DISPLAY_AT_USER_ID_PATTERN = re.compile(r"@[^()\r\n]*\((\d+)\)\s*$")
 AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
 你是 ProfileWeaver 的后台画像抽取器。
 你的唯一任务：只依据“当前用户本轮消息”，决定是否为当前消息发送者调用画像工具。
@@ -295,7 +298,7 @@ AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
     "ProfileWeaver",
     "Whereis-Alice",
     "更安全的用户画像记忆插件，使用 LLM 工具替代隐藏标签写入，并为每位用户支持自定义画像字段。",
-    "2.1.3",
+    "2.1.4",
 )
 class ProfileWeaverPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -362,6 +365,27 @@ class ProfileWeaverPlugin(Star):
 
     def _get_session_id(self, event: AstrMessageEvent) -> str | None:
         return event.unified_msg_origin if self.session_based else None
+
+    def _resolve_admin_target_user_id(self, event: AstrMessageEvent, raw_target: str) -> str:
+        """Prefer the actual ID carried by an At component over its display text."""
+        get_messages = getattr(event, "get_messages", None)
+        message_chain = get_messages() if callable(get_messages) else []
+        if isinstance(message_chain, (list, tuple)):
+            for segment in message_chain:
+                if not isinstance(segment, Comp.At):
+                    continue
+                target_user_id = str(getattr(segment, "qq", "")).strip()
+                if target_user_id and target_user_id.casefold() != "all":
+                    return target_user_id
+
+        target_user_id = str(raw_target or "").strip()
+        cq_match = CQ_AT_USER_ID_PATTERN.search(target_user_id)
+        if cq_match:
+            return cq_match.group(1)
+        display_match = DISPLAY_AT_USER_ID_PATTERN.search(target_user_id)
+        if display_match:
+            return display_match.group(1)
+        return target_user_id
 
     def _build_actor(self, event: AstrMessageEvent, actor_type: str) -> AuditActor:
         return AuditActor(
@@ -871,7 +895,7 @@ class ProfileWeaverPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查询画像")
     async def admin_query_profile(self, event: AstrMessageEvent, user_id: str) -> None:
-        target_user_id = str(user_id).strip()
+        target_user_id = self._resolve_admin_target_user_id(event, user_id)
         session_id = self._get_session_id(event)
         summary = self.store.format_profile_summary(target_user_id, session_id)
         if summary == "暂无记录":
@@ -891,7 +915,7 @@ class ProfileWeaverPlugin(Star):
         field_name: str,
         value: str,
     ) -> None:
-        target_user_id = str(user_id).strip()
+        target_user_id = self._resolve_admin_target_user_id(event, user_id)
         session_id = self._get_session_id(event)
         old_profile = self.store.get_profile(target_user_id, session_id)
         subject_name = str(old_profile.get("subject_name") or target_user_id)
@@ -918,7 +942,7 @@ class ProfileWeaverPlugin(Star):
         field_selector: str,
     ) -> None:
         result = self.store.delete_field(
-            user_id=str(user_id).strip(),
+            user_id=self._resolve_admin_target_user_id(event, user_id),
             session_id=self._get_session_id(event),
             field_selector=field_selector,
             actor=self._build_actor(event, "admin_command"),
@@ -931,7 +955,7 @@ class ProfileWeaverPlugin(Star):
     @filter.command("清空用户画像")
     async def admin_clear_profile(self, event: AstrMessageEvent, user_id: str) -> None:
         result = self.store.clear_profile(
-            user_id=str(user_id).strip(),
+            user_id=self._resolve_admin_target_user_id(event, user_id),
             session_id=self._get_session_id(event),
             actor=self._build_actor(event, "admin_command"),
         )
@@ -947,7 +971,7 @@ class ProfileWeaverPlugin(Star):
     ) -> None:
         session_id = self._get_session_id(event)
         entries = self.store.read_recent_audit(
-            user_id=str(user_id).strip(),
+            user_id=self._resolve_admin_target_user_id(event, user_id),
             session_id=session_id,
             limit=limit,
         )
