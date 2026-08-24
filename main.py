@@ -298,7 +298,7 @@ AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
     "ProfileWeaver",
     "Whereis-Alice",
     "更安全的用户画像记忆插件，使用 LLM 工具替代隐藏标签写入，并为每位用户支持自定义画像字段。",
-    "2.1.4",
+    "2.1.5",
 )
 class ProfileWeaverPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:

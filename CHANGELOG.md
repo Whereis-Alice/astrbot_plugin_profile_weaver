@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.1.5
+
+- 修复插件运行时依赖错误声明 AstrBot 核心的问题。
+- 避免 AstrBot Desktop 将第二份 AstrBot 安装到 `data/site-packages`，从而引发 `platform_stats` 数据表重复定义。
+- AstrBot 版本兼容范围继续通过 `metadata.yaml` 的 `astrbot_version` 声明。
+
 ## v2.1.4
 
 - 修复管理员指定用户画像时的 `@` 解析：`查询画像 @用户` 会使用 At 组件中的真实用户 ID，不再把展示昵称当成 ID 查询。

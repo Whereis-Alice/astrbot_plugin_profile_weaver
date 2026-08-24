@@ -1,1 +1,2 @@
-astrbot>=4.16,<5
+# AstrBot core is provided by the host application.
+# Do not install AstrBot itself as a plugin runtime dependency.
