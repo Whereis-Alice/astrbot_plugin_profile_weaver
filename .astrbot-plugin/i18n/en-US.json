@@ -1,0 +1,133 @@
+{
+  "metadata": {
+    "display_name": "Profile Weaver",
+    "short_desc": "Safe, auditable user profile memory with a WebUI panel.",
+    "desc": "Profile Weaver maintains user profiles under a strict \"current speaker only\" rule: the LLM writes through explicit tools and must quote evidence from the message, backed by an identity guard, a field denylist and a full audit trail. Ships with a Dashboard panel (7 themes), import/export, daily backups and restore, profile merging and statistics."
+  },
+  "pages": {
+    "profiles": {
+      "title": "Profile Weaver",
+      "desc": "Browse, edit, export and back up every user profile."
+    }
+  },
+  "config": {
+    "session_based": {
+      "description": "Isolate profiles per session",
+      "hint": "Off: one shared profile per user across chats. On: each group or private chat keeps its own profile."
+    },
+    "default_fields": {
+      "description": "Default profile fields",
+      "hint": "Global base fields. The LLM and user commands can still create per-user custom fields. More fields means a longer injected prompt; keep \"备注\" (notes) last."
+    },
+    "llm_write_denylist": {
+      "description": "Fields the LLM may not write",
+      "hint": "These fields can only be maintained by user commands or admins; LLM tools and auto-extraction are rejected. Good place for sensitive fields."
+    },
+    "max_notes_count": {
+      "description": "Number of notes to keep",
+      "hint": "The notes field keeps only the most recent N entries; older ones are dropped."
+    },
+    "llm_tools_enabled": {
+      "description": "Enable LLM profile tools",
+      "hint": "Off: the LLM can read profile context but cannot modify profiles."
+    },
+    "proactive_extraction_enabled": {
+      "description": "Enable low-cost auto extraction",
+      "hint": "On: runs one very short background tool loop only when the message looks like an explicit self-description and no profile tool was used in the main turn. Costs a few extra tokens."
+    },
+    "proactive_extraction_min_message_length": {
+      "description": "Minimum message length for auto extraction",
+      "hint": "Shorter messages never trigger auto extraction."
+    },
+    "proactive_extraction_max_message_length": {
+      "description": "Maximum message length for auto extraction",
+      "hint": "Longer messages are skipped to control token cost and false positives."
+    },
+    "proactive_extraction_max_steps": {
+      "description": "Max tool steps for auto extraction",
+      "hint": "Keep this at 1-2; more steps cost more tokens."
+    },
+    "allow_llm_custom_fields": {
+      "description": "Let the LLM create custom fields",
+      "hint": "On: the LLM may create per-user fields when the base fields are not enough."
+    },
+    "allow_user_custom_fields": {
+      "description": "Let users create custom fields via commands",
+      "hint": "Off: \"设置画像\" can only update existing fields."
+    },
+    "strict_identity_guard": {
+      "description": "Enable current-speaker identity guard",
+      "hint": "On: if the message clearly refers to someone else without a clear self-statement, LLM tools refuse to write."
+    },
+    "evidence_match_mode": {
+      "description": "Evidence validation strictness",
+      "hint": "strict: evidence must appear verbatim in the message; normalized: ignores whitespace and CJK/ASCII punctuation differences (recommended); loose: only requires enough key-fragment overlap.",
+      "labels": [
+        "Strict",
+        "Normalized (recommended)",
+        "Loose"
+      ]
+    },
+    "custom_field_name_max_length": {
+      "description": "Max custom field name length",
+      "hint": "Keep it short so the LLM does not create overly granular fields."
+    },
+    "field_value_max_length": {
+      "description": "Max field value length",
+      "hint": "Longer values are truncated so chat transcripts do not end up in the profile."
+    },
+    "allow_profile_in_group": {
+      "description": "Allow viewing your profile in group chats",
+      "hint": "Off: viewing a profile in a group chat is rejected to reduce privacy leaks."
+    },
+    "group_profile_denied_msg": {
+      "description": "Message shown when group viewing is denied",
+      "hint": "Used when allow_profile_in_group is false."
+    },
+    "profile_prompt_template": {
+      "description": "Profile prompt template injected into the LLM",
+      "hint": "Variables: {sender_id} {sender_name} {session_scope} {profile_summary} {field_catalog} {custom_field_catalog} {tool_names}"
+    },
+    "inject_when_empty": {
+      "description": "Inject the full prompt even when the profile is empty",
+      "hint": "Off: injects only a short note while the user has no profile yet, saving a lot of tokens."
+    },
+    "webui_enabled": {
+      "description": "Enable the WebUI profile panel",
+      "hint": "Off: no Web API is registered and the Dashboard page cannot read or write data. Requires a plugin reload."
+    },
+    "webui_allow_edit": {
+      "description": "Allow write operations from the WebUI",
+      "hint": "Off: the WebUI becomes read-only — no field edits, deletes, merges, imports or backup restores."
+    },
+    "webui_default_theme": {
+      "description": "Default WebUI theme",
+      "hint": "The browser remembers the theme you pick manually; this is only the first-visit default.",
+      "labels": [
+        "Aurora",
+        "Midnight",
+        "Sakura",
+        "Bamboo",
+        "Amber",
+        "Graphite",
+        "Paper"
+      ]
+    },
+    "export_mask_user_ids": {
+      "description": "Mask user IDs on export by default",
+      "hint": "On: user IDs and names are masked in exports. Masked files are for inspection only and cannot be imported back."
+    },
+    "audit_log_max_mb": {
+      "description": "Audit log file size limit (MB)",
+      "hint": "Rotates into a timestamped history file once exceeded so the audit log cannot grow forever."
+    },
+    "backup_retention_days": {
+      "description": "Backup retention (days)",
+      "hint": "A snapshot is taken on the first write of each day; backups older than this are cleaned up. 0 disables cleanup."
+    },
+    "debug_log_level": {
+      "description": "Log level",
+      "hint": "DEBUG logs more tool calls and identity-guard decisions."
+    }
+  }
+}

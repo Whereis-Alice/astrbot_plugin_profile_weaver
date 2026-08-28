@@ -1,0 +1,133 @@
+{
+  "metadata": {
+    "display_name": "心迹画像",
+    "short_desc": "安全可控的用户画像记忆，附带 WebUI 管理面板。",
+    "desc": "心迹画像（Profile Weaver）以「只写当前说话人」为核心原则维护用户画像：LLM 通过显式工具写入并需提供原文证据，配合身份护栏、字段黑名单与完整审计。内置 Dashboard 管理面板（7 套主题）、导入导出、每日备份与恢复、画像合并与统计。"
+  },
+  "pages": {
+    "profiles": {
+      "title": "心迹画像",
+      "desc": "浏览、编辑、导出与备份所有用户画像。"
+    }
+  },
+  "config": {
+    "session_based": {
+      "description": "是否按会话隔离用户画像",
+      "hint": "关闭时，同一用户跨群共享画像；开启后，不同群聊/私聊分别维护。"
+    },
+    "default_fields": {
+      "description": "默认基础画像字段",
+      "hint": "这里定义全局基础字段。LLM 和用户命令还可以在单个用户画像上创建自定义字段。字段越多注入提示词越长，可按需删减；「备注」建议保留在最后。"
+    },
+    "llm_write_denylist": {
+      "description": "禁止 LLM 自动写入的字段",
+      "hint": "这些字段只能由用户命令或管理员手动维护，LLM 工具与自动提取都会被拒绝。适合放敏感字段。"
+    },
+    "max_notes_count": {
+      "description": "备注保留条数",
+      "hint": "备注字段会自动保留最近几条，超出的旧备注会被挤掉。"
+    },
+    "llm_tools_enabled": {
+      "description": "是否启用 LLM 画像工具",
+      "hint": "关闭后，LLM 只能看到画像上下文，不能直接增删改画像。"
+    },
+    "proactive_extraction_enabled": {
+      "description": "是否启用低开销自动画像提取",
+      "hint": "开启后，只有在消息像明确自述且主对话本轮未使用画像工具时，才会额外发起一次很短的后台工具循环。会增加少量 token 消耗。"
+    },
+    "proactive_extraction_min_message_length": {
+      "description": "自动提取最短消息长度",
+      "hint": "太短的消息默认不触发自动提取。"
+    },
+    "proactive_extraction_max_message_length": {
+      "description": "自动提取最长消息长度",
+      "hint": "太长的消息默认不触发，以控制 token 开销和误判概率。"
+    },
+    "proactive_extraction_max_steps": {
+      "description": "自动提取最大工具步数",
+      "hint": "建议保持在 1 到 2；步数越高越耗 token。"
+    },
+    "allow_llm_custom_fields": {
+      "description": "是否允许 LLM 创建自定义画像字段",
+      "hint": "开启后，当基础字段不够时，LLM 可以为当前用户创建专属字段。"
+    },
+    "allow_user_custom_fields": {
+      "description": "是否允许用户通过命令创建自定义字段",
+      "hint": "关闭后，用户用「设置画像」只能修改已有字段。"
+    },
+    "strict_identity_guard": {
+      "description": "是否启用当前说话人身份护栏",
+      "hint": "开启后，消息里如果明显提到其他人且缺少明确自述，LLM 工具会拒绝写入画像。"
+    },
+    "evidence_match_mode": {
+      "description": "evidence 校验严格度",
+      "hint": "strict：evidence 必须原样出现在本轮消息里；normalized：忽略空白与中英标点差异（推荐）；loose：只要求关键片段重叠度足够。",
+      "labels": [
+        "严格",
+        "标准化（推荐）",
+        "宽松"
+      ]
+    },
+    "custom_field_name_max_length": {
+      "description": "自定义字段名最大长度",
+      "hint": "建议不要太长，避免 LLM 创建过度细碎的字段。"
+    },
+    "field_value_max_length": {
+      "description": "单个字段值最大长度",
+      "hint": "超过长度的内容会被截断，避免把整段聊天记录塞进画像。"
+    },
+    "allow_profile_in_group": {
+      "description": "是否允许在群聊里查看「我的画像」",
+      "hint": "关闭时，群聊中查看画像会被拒绝，以降低隐私泄露风险。"
+    },
+    "group_profile_denied_msg": {
+      "description": "群聊查看画像被拒绝时的提示语",
+      "hint": "当 allow_profile_in_group=false 时生效。"
+    },
+    "profile_prompt_template": {
+      "description": "注入给 LLM 的画像提示模板",
+      "hint": "支持变量：{sender_id} {sender_name} {session_scope} {profile_summary} {field_catalog} {custom_field_catalog} {tool_names}"
+    },
+    "inject_when_empty": {
+      "description": "画像为空时仍注入完整提示词",
+      "hint": "关闭后，用户还没有任何画像时只注入一段很短的说明，可显著节省 token。"
+    },
+    "webui_enabled": {
+      "description": "是否启用 WebUI 画像管理面板",
+      "hint": "关闭后不注册任何 Web API，Dashboard 页面将无法读写数据。修改后需要重载插件。"
+    },
+    "webui_allow_edit": {
+      "description": "WebUI 是否允许写操作",
+      "hint": "关闭后 WebUI 变成只读，禁止改字段、删画像、合并、导入和恢复备份。"
+    },
+    "webui_default_theme": {
+      "description": "WebUI 默认主题",
+      "hint": "浏览器本地会记住你手动切换过的主题，此项只作为首次进入的默认值。",
+      "labels": [
+        "极光",
+        "午夜",
+        "樱绯",
+        "竹青",
+        "琥珀",
+        "石墨",
+        "素白"
+      ]
+    },
+    "export_mask_user_ids": {
+      "description": "导出时默认脱敏用户 ID",
+      "hint": "开启后导出文件中的用户 ID 与昵称会被打码。脱敏文件仅供查看统计，无法再导入回来。"
+    },
+    "audit_log_max_mb": {
+      "description": "审计日志单文件上限 (MB)",
+      "hint": "超过后自动切割为带时间戳的历史文件，避免审计日志无限增长。"
+    },
+    "backup_retention_days": {
+      "description": "备份保留天数",
+      "hint": "插件每天首次写入时会自动快照一份画像，超过保留天数的备份会被清理。0 表示不清理。"
+    },
+    "debug_log_level": {
+      "description": "日志级别",
+      "hint": "DEBUG 会输出更多工具调用和身份护栏日志。"
+    }
+  }
+}

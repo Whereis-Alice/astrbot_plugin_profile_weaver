@@ -1,5 +1,44 @@
 # Changelog
 
+## v3.0.0
+
+### 品牌
+- 插件中文名由「画像织谱」更名为 **「心迹画像」**（副标题 `Profile Weaver`），同步更新 `metadata.yaml`、README 与面板标题。
+- 全新设计的 `logo.png`：深绿墨色圆角卡片 + 极光光晕，主体是一颗由经纬线织成的心，交点处的光点代表被记住的画像字段。
+
+### 新增：WebUI 管理面板
+- 新增 Dashboard 插件页面 `pages/profiles`，含 5 个分区：总览、画像库、审计、迁移、关于。
+- **7 套主题**：极光 / 午夜 / 樱绯 / 竹青 / 琥珀 / 石墨 / 素白，右上角实时切换并在浏览器本地记忆。
+- 信息密度切换（宽松 / 紧凑）、`/` 聚焦搜索、`Esc` 关闭详情抽屉、Toast 提示、骨架屏加载、启动失败降级卡片。
+- 画像库支持搜索、8 种排序、4 种筛选与分页；详情抽屉可逐字段编辑、追加/删除备注、查看每个字段的写入者与原文证据。
+- 总览提供字段填充率排行、写入来源分布、最近活跃画像与审计日志体积。
+- 新增 `web_api.py`：14 个 Dashboard 接口（`meta` `stats` `profiles` `profile` `profile-field` `profile-field-delete` `profile-delete` `profile-merge` `audit` `export` `import` `backups` `backup-create` `backup-restore`）。
+- 新增 `webui_enabled` / `webui_allow_edit` / `webui_default_theme` 配置；只读模式下 7 个写接口统一返回 403。
+
+### 新增：导入导出与备份
+- 导出为 `profileweaver.bundle` v2 JSON，可选脱敏、可选附带最近审计记录。
+- 导入支持 **merge（合并）/ overwrite（覆盖）/ replace（替换）** 三种模式，导入前自动创建 `pre-import-<mode>` 备份并写入审计。
+- 每日首次写入自动快照备份，新增 `backup_retention_days` 自动清理过期备份。
+- 新增命令：`画像备份 [标签]`、`画像备份列表`、`画像恢复备份 <文件名>`、`合并画像 <源key> <目标key>`、`画像面板`。
+- 恢复备份前会先备份当前数据，避免误操作不可回退。
+
+### 新增字段与配置
+- 基础字段从 16 项扩展到 22 项，新增 `MBTI`、`星座`、`时区`、`常用语言`、`沟通偏好`、`禁忌话题`；`备注` 仍恒定排在最后。
+- 新增 `evidence_match_mode`（`strict` / `normalized` / `loose`）：可调节 evidence 原文校验的严格度，默认 `normalized` 忽略空白与中英标点差异，减少合法写入被误拒。
+- 新增 `audit_log_max_mb`：审计日志超限自动轮转为带时间戳的历史文件。
+- 新增 `.astrbot-plugin/i18n/`（`zh-CN` / `en-US`）：插件名、描述、页面标题与全部 26 项配置文案支持国际化。
+
+### 修复
+- **修复脱敏导出的隐私泄漏**：开启脱敏导出时，此前只打码了 `subject_user_id` 与 `subject_name`，遗漏了 `field_meta[*].actor_id` / `actor_name`、`notes_meta` 中的操作者身份，以及 `audit[]` 里的全部身份字段。现已全部脱敏。
+- 主数据文件改为**原子写**（临时文件 + 替换），避免写入中断导致 `profiles.json` 截断损坏。
+- 主数据文件损坏时不再静默重置，会隔离为 `profiles.json.corrupt-<时间戳>` 后再新建，数据可人工抢救。
+- 备份恢复接口拒绝路径穿越（`..` / 绝对路径），只允许恢复备份目录内的文件。
+- 脱敏导出文件在导入时被明确拒绝，并给出可读原因，而不是导入出一堆打码用户。
+
+### 其他
+- 面板与命令输出统一了字段排序规则（基础字段顺序 → 自定义字段 → `备注`）。
+- 前端 26 项 jsdom 冒烟测试与后端 78 项端到端接口测试全部通过。
+
 ## v2.1.5
 
 - 修复插件运行时依赖错误声明 AstrBot 核心的问题。

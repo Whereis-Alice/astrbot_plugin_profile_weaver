@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN" data-pw-theme="aurora" data-pw-density="cozy">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>心迹画像 · Profile Weaver</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="pw-bg" aria-hidden="true"></div>
+
+    <div class="pw-root">
+      <header class="pw-header">
+        <div class="pw-brand">
+          <div class="pw-logo" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 27C10 22.5 5 18.8 5 13.6A6.1 6.1 0 0 1 16 9.9A6.1 6.1 0 0 1 27 13.6C27 18.8 22 22.5 16 27Z" />
+              <path d="M9.5 14.6c3 0 4.2 2.6 6.5 2.6s3.5-2.6 6.5-2.6" />
+            </svg>
+          </div>
+          <div>
+            <h1 class="pw-brand-title" id="pw-title">心迹画像</h1>
+            <p class="pw-brand-sub">
+              <span id="pw-subtitle">Profile Weaver</span>
+              <span class="dot">·</span>
+              <span class="mono" id="pw-version">v3.0.0</span>
+              <span class="dot">·</span>
+              <span id="pw-mode-hint">画像管理面板</span>
+            </p>
+          </div>
+        </div>
+
+        <div class="pw-actions">
+          <label class="pw-field" title="界面主题">
+            <select class="pw-select" id="pw-theme" aria-label="界面主题"></select>
+          </label>
+          <button class="pw-btn" id="pw-density" type="button" title="切换信息密度">
+            <span id="pw-density-label">紧凑</span>
+          </button>
+          <button class="pw-btn pw-btn--icon" id="pw-refresh" type="button" title="刷新数据"
+                  aria-label="刷新数据"></button>
+          <button class="pw-btn pw-btn--accent" id="pw-quick-export" type="button" title="导出全部画像">
+            <span>导出</span>
+          </button>
+        </div>
+      </header>
+
+      <nav class="pw-tabs" id="pw-tabs" role="tablist" aria-label="功能分区"></nav>
+
+      <main class="pw-main">
+        <section class="pw-panel" id="pw-panel-overview" role="tabpanel" aria-labelledby="pw-tab-overview"></section>
+        <section class="pw-panel" id="pw-panel-library" role="tabpanel" aria-labelledby="pw-tab-library" hidden></section>
+        <section class="pw-panel" id="pw-panel-audit" role="tabpanel" aria-labelledby="pw-tab-audit" hidden></section>
+        <section class="pw-panel" id="pw-panel-migrate" role="tabpanel" aria-labelledby="pw-tab-migrate" hidden></section>
+        <section class="pw-panel" id="pw-panel-about" role="tabpanel" aria-labelledby="pw-tab-about" hidden></section>
+      </main>
+
+      <footer class="pw-status">
+        <span id="pw-status-left" class="pw-status-left">正在载入…</span>
+        <span class="pw-status-right" id="pw-status-right"></span>
+      </footer>
+    </div>
+
+    <div class="pw-mask" id="pw-mask" hidden></div>
+    <aside class="pw-drawer" id="pw-drawer" role="dialog" aria-modal="true"
+           aria-labelledby="pw-drawer-title" hidden></aside>
+
+    <div class="pw-toasts" id="pw-toasts" role="status" aria-live="polite"></div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

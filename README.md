@@ -1,125 +1,241 @@
-# 画像织谱 (ProfileWeaver)
+<div align="center">
 
-`astrbot_plugin_profile_weaver` 是一个面向 AstrBot 的用户画像记忆插件。它基于上游项目 [Luna-channel/astrbot_plugin_soulmap](https://github.com/Luna-channel/astrbot_plugin_soulmap) 做了重构式 fork，已经更换插件名、显示名、数据目录和代码标识符，可以和原插件并装而不互相覆盖。
+<img src="./logo.png" alt="心迹画像 Profile Weaver" width="132" />
 
-更新历史见 [CHANGELOG.md](CHANGELOG.md)。
+# 心迹画像 · Profile Weaver
 
-## 与上游的关系
+**安全可控的 AstrBot 用户画像记忆插件 —— 只写当前说话人，句句留证据，附带一套好看的 Dashboard 管理面板。**
 
-- 上游插件：[`Luna-channel/astrbot_plugin_soulmap`](https://github.com/Luna-channel/astrbot_plugin_soulmap)
-- 本 fork 不再依赖 `[Profile: ...]` / `[ProfileDelete: ...]` 这类隐藏标签，而是使用 AstrBot 的 `FunctionTool` 工作流。
-- 插件目录名和 `metadata.yaml` 里的 `name` 是 `astrbot_plugin_profile_weaver`，避免与 `astrbot_plugin_soulmap` 冲突。
+![version](https://img.shields.io/badge/version-v3.0.0-3ddc97) ![astrbot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-6c8cff) ![license](https://img.shields.io/badge/license-MIT-9aa4b2)
 
-## 核心能力
+</div>
 
-- 显式 LLM 工具：LLM 通过 `profileweaver_view_profile`、`profileweaver_remember_field`、`profileweaver_forget_field` 查看、写入和删除画像。
-- 自定义字段：当内置字段不够用时，LLM 或用户命令可以为当前用户创建专属字段；配置允许时，LLM 写入未知字段会自动按自定义字段处理。
-- 自动提取：主对话没有调用画像工具时，插件可用一次短工具循环补充提取高置信画像信息。
-- 审计日志：每次变更都会记录操作者、来源、证据、旧值和新值。
-- 管理员维护：管理员可以查询、修改、删除、清空其他用户画像，并查看审计记录和统计。
-- 旧数据兼容：自动探测并迁移上游 `user_profiles.json`，支持旧目录自动导入和字段级合并。
+---
 
-## 安全边界
+## 这个插件解决什么问题
 
-ProfileWeaver 的目标不是把画像写得越多越好，而是尽量减少“写错人、写冲突、写脏数据”。
+大多数"记忆"插件的通病是**记错人**：群里 A 提到 B 的生日，模型就把生日写进了 A 的画像；或者把一句玩笑、一次角色扮演当成稳定事实存了下来。
 
-- 只允许 LLM 修改当前消息发送者的画像，不能通过工具直接改其他群友。
-- 工具要求提供 `evidence`，且证据必须来自当前用户本轮消息。
-- 如果当前消息提到他人、转述、角色扮演或多人物上下文，工具会更保守，避免把别人的信息写到当前用户身上。
-- 昵称、名字、称呼、别名、网名、用户名会做冲突检测：全局模式下全局查重；会话隔离模式下只在当前会话查重。名字也不能和同作用域内的备注互相复用。
-- 网名可以自由表达，例如 `狐狸` 可以作为昵称或网名；但 `爸爸`、`主人`、`管理员`、`系统` 这类冒犯、诱导或冒充权限的称呼会被拒绝。
-- 直接修改指令是允许的，例如“给我的画像添加狐狸”；工具层只拒绝冲突、重复和明显误导/恶劣的称呼。
+心迹画像的做法是把写入变成一件**需要举证的显式操作**：
 
-## 默认字段
+- LLM 不能"顺手"改画像，只能调用 `profileweaver_remember_field` / `profileweaver_forget_field` 工具；
+- 每次写入必须附带 `evidence`（本轮消息中的原文片段），校验不通过直接拒绝；
+- **身份护栏**：消息明显在谈论他人、缺少明确自述时拒绝写入；
+- **字段黑名单**：敏感字段（默认 `健康状况`）永远只能由本人命令或管理员维护；
+- 所有变更写入 `audit_log.jsonl`，谁改的、改前改后是什么、依据哪句话，全部可回溯。
 
-内置画像字段：
+在此之上，v3.0.0 补齐了运维侧：可视化面板、导入导出、每日自动备份与一键恢复。
 
-- 昵称
-- 性别
-- 年龄
-- 所在地
-- 生日
-- 爱吃
-- 忌口
-- 爱好
-- 职业
-- 重要节日
-- 恐惧/弱点
-- 作息规律
-- 技能水平
-- 健康状况
-- 宠物
-- 备注
+---
 
-除此之外，每个用户都可以拥有自己的自定义字段，比如 `学校`、`MBTI`、`常用语言`、`追番偏好`。展示画像时，`备注` 始终排在最后。
+## WebUI 管理面板
 
-## 指令
+安装后在 AstrBot Dashboard 侧栏进入 **心迹画像**，或在聊天里发 `画像面板` 获取入口。
 
-### 用户指令
+| 分区 | 能做什么 |
+| --- | --- |
+| **总览** | 画像总数 / 字段总数 / 备注总数 / 自定义字段数、审计日志体积、字段填充率排行、最近活跃画像、写入来源分布 |
+| **画像库** | 搜索、8 种排序、4 种筛选、分页浏览；点开抽屉可逐字段编辑、追加/删除备注、查看每个字段的写入者与证据、删除整份画像 |
+| **审计** | 按用户 / 动作 / 来源筛选审计流水，展示改前改后与原文证据 |
+| **迁移** | 导出（可选脱敏、可选附带审计）、导入（合并 / 覆盖 / 替换三种模式）、手动创建备份、查看与恢复历史备份 |
+| **关于** | 全部 16 条聊天命令速查、当前生效配置一览 |
 
-| 指令 | 说明 | 示例 |
+**7 套主题**（右上角实时切换，浏览器本地记忆）：
+
+| id | 名称 | 主色 |
 | --- | --- | --- |
-| `我的画像` | 查看自己的画像 | `我的画像` |
-| `画像字段` | 查看当前可用字段 | `画像字段` |
-| `设置画像 <字段> <内容>` | 手动设置自己的画像字段 | `设置画像 网名 狐狸` |
-| `删除画像 <字段>` | 删除自己的某个字段 | `删除画像 学校` |
-| `删除画像 备注:2` | 删除自己的第 2 条备注 | `删除画像 备注:2` |
-| `清空画像` | 清空自己的画像 | `清空画像` |
+| `aurora` | 极光 | `#3ddc97` |
+| `midnight` | 午夜 | `#6c8cff` |
+| `sakura` | 樱绯 | `#ff8fab` |
+| `bamboo` | 竹青 | `#7bd88f` |
+| `amber` | 琥珀 | `#ffb454` |
+| `graphite` | 石墨 | `#9aa4b2` |
+| `paper` | 素白 | `#2f6f5e` |
 
-### 管理员指令
+另有**信息密度切换**（宽松 / 紧凑）、`/` 聚焦搜索、`Esc` 关闭抽屉、Toast 提示与骨架屏加载。
 
-| 指令 | 说明 | 示例 |
-| --- | --- | --- |
-| `查询画像 <QQ号或@用户>` | 查看指定用户画像 | `查询画像 @某用户` |
-| `修改画像 <QQ号或@用户> <字段> <内容>` | 修改或新增指定用户画像字段 | `修改画像 @某用户 学校 复旦` |
-| `删除画像字段 <QQ号或@用户> <字段>` | 删除指定用户某个字段 | `删除画像字段 @某用户 学校` |
-| `清空用户画像 <QQ号或@用户>` | 清空指定用户画像 | `清空用户画像 @某用户` |
-| `画像审计 <QQ号或@用户> [条数]` | 查看最近变更日志 | `画像审计 @某用户 5` |
-| `画像统计` | 查看系统画像覆盖情况 | `画像统计` |
+---
 
-## 自动提取策略
+## 命令
 
-自动提取是后置补充流程，不会替代主对话。
+### 用户命令
 
-- 如果主对话已经调用画像工具，本轮不会再补提取。
-- 明确键值式自述会优先低成本写入，例如 `我最喜欢的国漫：凡人修仙传` 会创建 `最喜欢的国漫` 字段。
-- 自动提取只看当前用户本轮消息，不带长历史，默认最多 2 步。
-- 消息太长、像转述、像多人物对话或风险偏高时，会直接跳过。
-- 开启后会增加少量 token 消耗；如果希望更省，可以把 `proactive_extraction_max_steps` 设为 `1`。
+| 命令 | 说明 |
+| --- | --- |
+| `我的画像` | 查看自己的画像（群聊中默认拒绝，见 `allow_profile_in_group`） |
+| `画像字段` | 列出全部可用字段（基础字段 + 自己的自定义字段） |
+| `设置画像 <字段> <值>` | 手动写入/修改一个字段，`备注` 为追加 |
+| `删除画像 <字段\|备注序号>` | 删除一个字段，或按序号删除某条备注 |
+| `清空画像` | 清空自己的全部画像 |
+
+### 管理员命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `查询画像 <用户\|@某人>` | 查看指定用户画像（支持 QQ 号或 At） |
+| `修改画像 <用户> <字段> <值>` | 代为写入字段 |
+| `删除画像字段 <用户> <字段>` | 删除指定字段 |
+| `清空用户画像 <用户>` | 清空该用户画像 |
+| `画像审计 <用户> [条数]` | 查看该用户的变更流水 |
+| `画像统计` | 全局统计概览 |
+| `画像备份 [标签]` | 立即创建一份带标签的备份 |
+| `画像备份列表` | 列出现存备份 |
+| `画像恢复备份 <文件名>` | 从备份恢复（恢复前自动再备份一次当前数据） |
+| `合并画像 <源key> <目标key>` | 合并两份画像（例如用户换号、开启会话隔离后整理数据） |
+| `画像面板` | 输出 Dashboard 面板入口与当前状态 |
+
+> `key` 的格式是 `<session_id>_<user_id>`，例如 `aiocqhttp:GroupMessage:1234_10001`；关闭会话隔离时为 `_<user_id>` 形式。面板画像库里可以直接复制。
+
+---
+
+## 画像字段
+
+默认 22 个基础字段，全部可在配置里增删：
+
+`昵称`、`性别`、`年龄`、`所在地`、`生日`、`爱吃`、`忌口`、`爱好`、`职业`、`重要节日`、`恐惧/弱点`、`作息规律`、`技能水平`、`健康状况`、`宠物`、`MBTI`、`星座`、`时区`、`常用语言`、`沟通偏好`、`禁忌话题`、`备注`
+
+- `备注` 是多条列表字段，保留最近 N 条（`max_notes_count`），且在展示与导出中恒定排在最后。
+- 基础字段不够用时，LLM 或用户可以创建**当前用户专属自定义字段**（如"最喜欢的国漫""常用编辑器"），受 `allow_llm_custom_fields` / `allow_user_custom_fields` / `custom_field_name_max_length` 约束。
+- `时区`、`常用语言`、`沟通偏好`、`禁忌话题` 这几个字段对回复风格影响最直接，建议保留。
+
+---
+
+## LLM 工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `profileweaver_view_profile` | 读取当前说话人的画像 |
+| `profileweaver_remember_field` | 写入/更新一个字段，必须提供 `evidence` |
+| `profileweaver_forget_field` | 删除一个字段，必须确认用户明确要求 |
+
+写入被拒绝时工具会返回明确原因（黑名单 / 证据不匹配 / 身份护栏 / 重复 / 冲突），提示词要求模型如实告知用户"没有写入"。
+
+此外还有一条**低开销自动提取**通路：仅当消息长度在区间内、看起来是明确自述、且主对话本轮没调用过画像工具时，才额外发起一次最多 2 步的后台工具循环（`proactive_extraction_*`）。像 `我最喜欢的国漫：凡人修仙传` 这种明确键值自述会走零额外 token 的本地兜底。
+
+---
+
+## 导入 / 导出
+
+导出产物是一个 `profileweaver.bundle` v2 JSON：
+
+```json
+{
+  "format": "profileweaver.bundle",
+  "version": 2,
+  "exported_at": "2026-08-29T12:00:00+08:00",
+  "plugin_version": "3.0.0",
+  "session_based": false,
+  "masked": false,
+  "profile_count": 42,
+  "profiles": { "_10001": { "fields": {}, "field_meta": {}, "notes": [] } }
+}
+```
+
+三种导入模式：
+
+- **merge（合并）**：逐字段合并，同名字段以导入文件为准，其余保留 —— 最安全，默认；
+- **overwrite（覆盖）**：同 key 的画像整份替换，其他 key 保留；
+- **replace（替换）**：用文件内容整体替换现有数据。
+
+任何导入之前都会自动创建 `pre-import-<mode>` 备份，并写入审计。
+
+> **脱敏导出不可导入。** 开启 `export_mask_user_ids`（或在面板勾选脱敏）后，用户 ID、昵称以及审计记录里的操作者身份都会被不可逆打码，这类文件只能用于查看统计，导入会被明确拒绝。
+
+---
 
 ## 配置项
 
-| 配置项 | 说明 | 默认值 |
+共 26 项，在 Dashboard 插件配置页可视化编辑（已提供中英文 i18n）。
+
+### 作用域与字段
+
+| 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `session_based` | 是否按会话隔离画像；开启后画像和同名冲突检测都按当前群聊/私聊隔离 | `false` |
-| `default_fields` | 默认基础字段列表 | 见上文 |
-| `max_notes_count` | 备注保留条数 | `5` |
-| `llm_tools_enabled` | 是否启用 LLM 工具 | `true` |
-| `proactive_extraction_enabled` | 是否启用低开销自动提取 | `true` |
-| `proactive_extraction_min_message_length` | 自动提取最短消息长度 | `4` |
-| `proactive_extraction_max_message_length` | 自动提取最长消息长度 | `120` |
-| `proactive_extraction_max_steps` | 自动提取最大工具步数 | `2` |
-| `allow_llm_custom_fields` | 是否允许 LLM 创建自定义字段 | `true` |
-| `allow_user_custom_fields` | 是否允许用户命令创建自定义字段 | `true` |
-| `strict_identity_guard` | 是否启用当前说话人身份护栏 | `true` |
-| `custom_field_name_max_length` | 自定义字段最大长度 | `16` |
-| `field_value_max_length` | 单字段值最大长度 | `160` |
-| `allow_profile_in_group` | 是否允许在群聊查看 `我的画像` | `false` |
-| `group_profile_denied_msg` | 群聊查看画像被拒绝时的提示语 | 自带默认值 |
-| `profile_prompt_template` | 注入给 LLM 的画像提示模板 | 自带默认值 |
-| `debug_log_level` | 插件调试日志级别 | `INFO` |
+| `session_based` | `false` | 是否按会话隔离画像 |
+| `default_fields` | 22 项 | 全局基础字段 |
+| `llm_write_denylist` | `["健康状况"]` | 禁止 LLM 写入的字段 |
+| `max_notes_count` | `5` | 备注保留条数 |
+| `allow_llm_custom_fields` | `true` | 允许 LLM 创建自定义字段 |
+| `allow_user_custom_fields` | `true` | 允许用户命令创建自定义字段 |
+| `custom_field_name_max_length` | `16` | 自定义字段名长度上限 |
+| `field_value_max_length` | `160` | 字段值长度上限 |
 
-## 迁移与数据
+### 安全与护栏
 
-数据保存在 `data/plugin_data/astrbot_plugin_profile_weaver/`：
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `strict_identity_guard` | `true` | 当前说话人身份护栏 |
+| `evidence_match_mode` | `normalized` | 证据校验严格度：`strict` / `normalized` / `loose` |
+| `allow_profile_in_group` | `false` | 是否允许群聊查看画像 |
+| `group_profile_denied_msg` | — | 群聊拒绝时的提示语 |
 
-- `profiles.json`：画像主数据
-- `audit_log.jsonl`：画像变更审计日志
-- `migration_state.json`：旧插件目录导入状态与签名记录
+### LLM 与提示词
 
-兼容行为：
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `llm_tools_enabled` | `true` | 启用画像工具 |
+| `profile_prompt_template` | 见默认值 | 注入模板，支持 7 个变量 |
+| `inject_when_empty` | `false` | 画像为空时是否注入完整提示词 |
+| `proactive_extraction_enabled` | `true` | 低开销自动提取 |
+| `proactive_extraction_min_message_length` | `4` | 自动提取最短长度 |
+| `proactive_extraction_max_message_length` | `120` | 自动提取最长长度 |
+| `proactive_extraction_max_steps` | `2` | 自动提取最大步数 |
 
-- 会主动探测 `astrbot_plugin_soulmap` / `SoulMap` / `soulmap` 等旧目录下的 `user_profiles.json`。
-- 迁移采用字段级合并，较新的字段优先，`备注` 会去重合并。
-- 旧字段名会归一：`称呼`、`名字`、`姓名`、`对用户的称呼` 会合并到新版 `昵称`，展示时排在第一位。
-- 如果你之前给上游插件写过隐藏标签提示词，建议移除，避免模型继续输出已经失效的标记。
+### WebUI、数据与日志
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `webui_enabled` | `true` | 是否注册 Web API 与面板 |
+| `webui_allow_edit` | `true` | 关闭后面板变只读 |
+| `webui_default_theme` | `aurora` | 首次进入的默认主题 |
+| `export_mask_user_ids` | `false` | 导出默认脱敏 |
+| `audit_log_max_mb` | `8` | 审计日志单文件上限，超出自动轮转 |
+| `backup_retention_days` | `14` | 备份保留天数，`0` 表示不清理 |
+| `debug_log_level` | `INFO` | `DEBUG` 输出更多护栏日志 |
+
+---
+
+## 数据与文件
+
+插件数据目录（AstrBot 分配）下：
+
+```text
+profiles.json                 # 主数据，原子写（临时文件 + 替换）
+audit_log.jsonl               # 审计流水，超过 audit_log_max_mb 自动轮转
+audit_log.jsonl.<timestamp>   # 轮转后的历史审计
+backups/                      # 每日首次写入自动快照 + 手动/导入前备份
+profiles.json.corrupt-<ts>    # 主文件损坏时隔离的原文件（不会静默丢数据）
+```
+
+历史版本的 `user_profiles.json` 会在首次启动时自动迁移。
+
+---
+
+## 安全须知
+
+1. **Dashboard 鉴权就是画像的鉴权。** 面板 14 个接口挂在 AstrBot 的 `/api/plug/...` 下，任何能登录 Dashboard 的人都能读写全部画像。请务必给 Dashboard 设强密码，不要把它裸奔在公网上。
+2. **数据是明文 JSON。** `profiles.json` 与备份都未加密，请按普通敏感数据对待（备份目录、快照、镜像都算）。
+3. **只读模式**：把 `webui_allow_edit` 关掉后，改字段、删画像、合并、导入、恢复备份这 7 个写接口会统一返回 403，适合只想看数据的场景。
+4. **导入是高风险操作。** `replace` 会整体替换数据；虽然导入前会自动备份，但请先确认文件来源可信 —— 导入文件里的字段值会被注入到后续的 LLM 提示词中。
+5. **脱敏包不可逆**，也不可导入，别把它当备份用。
+
+---
+
+## 安装
+
+在 AstrBot Dashboard 的插件市场搜索安装，或手动克隆到插件目录：
+
+```bash
+cd AstrBot/data/plugins
+git clone https://github.com/Whereis-Alice/astrbot_plugin_profile_weaver.git
+```
+
+重启或重载插件后，在 Dashboard 侧栏即可看到 **心迹画像** 页面。插件不引入任何第三方运行时依赖。
+
+---
+
+## 许可
+
+[MIT](./LICENSE) © Whereis-Alice
+
+本项目最初参考 [Luna-channel/astrbot_plugin_soulmap](https://github.com/Luna-channel/astrbot_plugin_soulmap) 的思路，现已完全重写。

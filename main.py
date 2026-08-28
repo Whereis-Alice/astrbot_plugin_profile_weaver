@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from astrbot.api import AstrBotConfig, ToolSet, logger
@@ -25,6 +27,7 @@ try:
         BLOCKED_PROFILE_NAME_VALUES,
         ProfileStore,
     )
+    from .web_api import ProfileWebApi
 except ImportError:
     from llm_tools import (
         FORGET_TOOL_NAME,
@@ -41,6 +44,7 @@ except ImportError:
         BLOCKED_PROFILE_NAME_VALUES,
         ProfileStore,
     )
+    from web_api import ProfileWebApi
 
 DEFAULT_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
 当前说话人：{sender_name} ({sender_id})
@@ -68,6 +72,51 @@ DEFAULT_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
 
 可用工具：{tool_names}
 </ProfileWeaver>"""
+
+EMPTY_PROFILE_SUMMARY = "暂无记录"
+
+LEAN_PROFILE_PROMPT_TEMPLATE = """<ProfileWeaver>
+当前说话人：{sender_name} ({sender_id})
+当前画像：暂无记录。
+
+只有当这位发送者明确、稳定地自述个人信息（称呼、口味、忌口、爱好、职业、所在地、作息等）时，才调用画像写入工具建立第一条记录。
+提到他人、转述、玩笑、角色扮演或信息不确定时，不要写入。
+
+可用工具：{tool_names}
+</ProfileWeaver>"""
+
+# NFKC folding already unifies most full-width forms; these pairs cover the
+# CJK punctuation that has no ASCII equivalent under NFKC.
+EVIDENCE_PUNCTUATION_TABLE = str.maketrans(
+    {
+        "，": ",",
+        "。": ".",
+        "、": ",",
+        "；": ";",
+        "：": ":",
+        "？": "?",
+        "！": "!",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "「": '"',
+        "」": '"',
+        "『": '"',
+        "』": '"',
+        "（": "(",
+        "）": ")",
+        "【": "[",
+        "】": "]",
+        "《": "<",
+        "》": ">",
+        "—": "-",
+        "－": "-",
+        "～": "~",
+        "…": ".",
+        "·": ".",
+    }
+)
 
 REMEMBER_SOURCE_KINDS = {"self_report", "self_preference", "self_correction"}
 FORGET_SOURCE_KINDS = {"self_request", "self_correction"}
@@ -297,10 +346,35 @@ AUTO_EXTRACT_SYSTEM_PROMPT = """<ProfileWeaverAutoExtract>
 @register(
     "ProfileWeaver",
     "Whereis-Alice",
-    "更安全的用户画像记忆插件，使用 LLM 工具替代隐藏标签写入，并为每位用户支持自定义画像字段。",
-    "2.1.5",
+    "心迹画像：更安全的用户画像记忆插件。LLM 工具显式写入 + 身份护栏 + 审计留痕 + Dashboard 可视化管理。",
+    "3.0.0",
 )
 class ProfileWeaverPlugin(Star):
+    DISPLAY_NAME = "心迹画像"
+    SUBTITLE = "Profile Weaver"
+    VERSION = "3.0.0"
+
+    USER_COMMANDS: tuple[tuple[str, str], ...] = (
+        ("我的画像", "查看自己的画像（默认仅私聊可用）"),
+        ("画像字段", "列出当前可用的基础字段与自定义字段"),
+        ("设置画像 <字段> <值>", "手动写入或更新自己的某个字段"),
+        ("删除画像 <字段|备注序号>", "删除自己的某个字段或某条备注"),
+        ("清空画像", "清空自己的全部画像"),
+    )
+    ADMIN_COMMANDS: tuple[tuple[str, str], ...] = (
+        ("查询画像 <用户|@某人>", "查看指定用户的画像"),
+        ("修改画像 <用户> <字段> <值>", "为指定用户写入字段"),
+        ("删除画像字段 <用户> <字段>", "删除指定用户的某个字段"),
+        ("清空用户画像 <用户>", "清空指定用户的画像"),
+        ("画像审计 <用户> [条数]", "查看最近的画像变更审计"),
+        ("画像统计", "查看画像总量与字段覆盖率"),
+        ("画像备份 [标签]", "立即生成一份画像快照备份"),
+        ("画像备份列表", "列出数据目录下的备份文件"),
+        ("画像恢复备份 <文件名>", "从指定备份恢复（会先自动备份当前数据）"),
+        ("合并画像 <源key> <目标key>", "把两条画像合并成一条，常用于跨会话去重"),
+        ("画像面板", "输出 Dashboard 可视化面板的入口说明"),
+    )
+
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.config = config
@@ -314,6 +388,8 @@ class ProfileWeaverPlugin(Star):
             max_notes_count=self.config.get("max_notes_count", 5),
             custom_field_name_max_length=self.config.get("custom_field_name_max_length", 16),
             field_value_max_length=self.config.get("field_value_max_length", 160),
+            audit_log_max_mb=self._safe_float(self.config.get("audit_log_max_mb", 8.0), 8.0),
+            backup_retention_days=self._safe_int(self.config.get("backup_retention_days", 14), 14),
         )
         self.context.add_llm_tools(
             ProfileWeaverViewTool(plugin=self, active=self._llm_tools_enabled()),
@@ -326,6 +402,51 @@ class ProfileWeaverPlugin(Star):
                 ProfileWeaverForgetTool(plugin=self, active=True),
             ]
         )
+
+        self.web_api: ProfileWebApi | None = None
+        if bool(self.config.get("webui_enabled", True)):
+            try:
+                self.web_api = ProfileWebApi(self)
+                registered = self.web_api.register(self.context)
+                logger.info(f"[ProfileWeaver] WebUI 已启用，注册 {registered} 个接口。")
+            except Exception as exc:
+                self.web_api = None
+                logger.error(f"[ProfileWeaver] WebUI 接口注册失败，面板将不可用：{exc}")
+
+    # ------------------------------------------------------------- config读取
+    @staticmethod
+    def _safe_int(raw: Any, fallback: int) -> int:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _safe_float(raw: Any, fallback: float) -> float:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+    def command_catalog(self) -> dict[str, list[dict[str, str]]]:
+        return {
+            "user": [{"command": name, "desc": desc} for name, desc in self.USER_COMMANDS],
+            "admin": [{"command": name, "desc": desc} for name, desc in self.ADMIN_COMMANDS],
+        }
+
+    def llm_write_denylist(self) -> list[str]:
+        raw = self.config.get("llm_write_denylist") or []
+        if isinstance(raw, str):
+            raw = [part for part in re.split(r"[,，\s]+", raw) if part]
+        names: list[str] = []
+        for item in raw:
+            canonical = self.store.canonical_field_name(str(item))
+            if canonical and canonical not in names:
+                names.append(canonical)
+        return names
+
+    def _is_llm_write_denied(self, field_name: str) -> bool:
+        return self.store.canonical_field_name(field_name) in set(self.llm_write_denylist())
 
     @property
     def session_based(self) -> bool:
@@ -395,6 +516,21 @@ class ProfileWeaverPlugin(Star):
         )
 
     def _is_group_chat(self, event: AstrMessageEvent) -> bool:
+        """Prefer the framework's own private/group signal over UMO string matching."""
+        is_private = getattr(event, "is_private_chat", None)
+        if callable(is_private):
+            try:
+                return not bool(is_private())
+            except Exception:  # pragma: no cover - adapter dependent
+                pass
+        get_message_type = getattr(event, "get_message_type", None)
+        if callable(get_message_type):
+            try:
+                message_type = str(get_message_type() or "")
+                if message_type:
+                    return "group" in message_type.lower()
+            except Exception:  # pragma: no cover - adapter dependent
+                pass
         origin = str(event.unified_msg_origin or "")
         return "group" in origin.lower()
 
@@ -421,7 +557,7 @@ class ProfileWeaverPlugin(Star):
         return self._contains_any(text, HARD_THIRD_PARTY_MARKERS)
 
     def _is_blocked_profile_label(self, value: str) -> bool:
-        return any(token in BLOCKED_PROFILE_NAME_VALUES for token, _ in self.store._extract_conflict_tokens(value))
+        return any(token in BLOCKED_PROFILE_NAME_VALUES for token, _ in self.store.extract_conflict_tokens(value))
 
     @staticmethod
     def _mentions_multi_subject_context(text: str) -> bool:
@@ -612,11 +748,21 @@ class ProfileWeaverPlugin(Star):
         finally:
             self._set_auto_extract_running(event, False)
 
-    def _build_prompt(self, event: AstrMessageEvent) -> str:
+    def _build_prompt(self, event: AstrMessageEvent) -> str | None:
         sender_id = str(event.get_sender_id())
         sender_name = str(event.get_sender_name())
         session_id = self._get_session_id(event)
         profile_summary = self.store.format_profile_summary(sender_id, session_id)
+        if profile_summary == EMPTY_PROFILE_SUMMARY and not bool(
+            self.config.get("inject_when_empty", False)
+        ):
+            if not self._llm_tools_enabled():
+                return None
+            return LEAN_PROFILE_PROMPT_TEMPLATE.format(
+                sender_name=sender_name,
+                sender_id=sender_id,
+                tool_names=", ".join([VIEW_TOOL_NAME, REMEMBER_TOOL_NAME, FORGET_TOOL_NAME]),
+            )
         field_catalog = self.store.format_field_catalog(sender_id, session_id)
         custom_field_catalog = self.store.format_custom_field_catalog(sender_id, session_id)
         prompt_template = self.config.get("profile_prompt_template") or self.config.get("profile_prompt") or DEFAULT_PROFILE_PROMPT_TEMPLATE
@@ -647,7 +793,7 @@ class ProfileWeaverPlugin(Star):
             return "拒绝执行：当前消息为空，无法校验画像依据。"
         if not evidence_text:
             return "拒绝执行：evidence 不能为空。"
-        if evidence_text not in message_text:
+        if not self._evidence_matches_message(evidence_text, message_text):
             return "拒绝执行：evidence 必须直接来自当前用户本轮消息。"
         if source_kind in REMEMBER_SOURCE_KINDS:
             remember_error = self._validate_remember_intent(
@@ -664,12 +810,51 @@ class ProfileWeaverPlugin(Star):
             return "拒绝执行：当前消息提到他人时，evidence 还必须包含明确自述，避免截取成歧义片段。"
         return None
 
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Fold width, drop whitespace and unify CJK/ASCII punctuation for comparison."""
+        folded = unicodedata.normalize("NFKC", str(text or "")).casefold()
+        folded = folded.translate(EVIDENCE_PUNCTUATION_TABLE)
+        return re.sub(r"[\s\u3000]+", "", folded)
+
+    def _evidence_matches_message(self, evidence_text: str, message_text: str) -> bool:
+        mode = str(self.config.get("evidence_match_mode", "normalized")).strip().lower()
+        if mode == "strict":
+            return evidence_text in message_text
+        if evidence_text in message_text:
+            return True
+
+        normalized_evidence = self._normalize_for_match(evidence_text)
+        normalized_message = self._normalize_for_match(message_text)
+        if not normalized_evidence:
+            return False
+        if normalized_evidence in normalized_message:
+            return True
+        if mode != "loose":
+            return False
+
+        # loose: allow lightly rephrased evidence as long as most of it is covered.
+        window = 4
+        if len(normalized_evidence) <= window:
+            return normalized_evidence in normalized_message
+        grams = {
+            normalized_evidence[index : index + window]
+            for index in range(len(normalized_evidence) - window + 1)
+        }
+        hits = sum(1 for gram in grams if gram in normalized_message)
+        return bool(grams) and hits / len(grams) >= 0.7
+
     def _validate_remember_intent(
         self,
         *,
         field_name: str,
         value: str,
     ) -> str | None:
+        if self._is_llm_write_denied(field_name):
+            return (
+                f"拒绝执行：字段「{field_name}」已被管理员列入 LLM 写入黑名单，只能由用户命令或管理员手动维护。"
+                "请告诉用户没有写入，并建议用「设置画像」命令自行填写。"
+            )
         if self.store.canonical_field_name(field_name) == NOTES_FIELD_NAME and self._is_blocked_profile_label(value):
             return (
                 "拒绝执行：备注值像恶劣、冒犯、诱导或混淆系统身份的称呼，容易误导后续对用户的认知。"
@@ -797,6 +982,8 @@ class ProfileWeaverPlugin(Star):
         if self._is_auto_extract_running(event):
             return
         prompt = self._build_prompt(event)
+        if prompt is None:
+            return
         current_system_prompt = str(req.system_prompt or "").rstrip()
         req.system_prompt = f"{current_system_prompt}\n\n{prompt}".strip()
 
@@ -826,7 +1013,7 @@ class ProfileWeaverPlugin(Star):
         await self._run_proactive_extraction(event, message_text)
 
     @filter.command("我的画像")
-    async def show_my_profile(self, event: AstrMessageEvent) -> None:
+    async def show_my_profile(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         if self._is_group_chat(event) and not bool(self.config.get("allow_profile_in_group", False)):
             denied_msg = self.config.get(
                 "group_profile_denied_msg",
@@ -838,7 +1025,7 @@ class ProfileWeaverPlugin(Star):
         user_id = str(event.get_sender_id())
         session_id = self._get_session_id(event)
         summary = self.store.format_profile_summary(user_id, session_id)
-        if summary == "暂无记录":
+        if summary == EMPTY_PROFILE_SUMMARY:
             yield event.plain_result("暂时还没有你的画像记录。")
             return
 
@@ -846,14 +1033,14 @@ class ProfileWeaverPlugin(Star):
         yield event.plain_result(f"你的画像：\n{summary}\n\n最后更新：{last_updated}")
 
     @filter.command("画像字段")
-    async def show_field_catalog(self, event: AstrMessageEvent) -> None:
+    async def show_field_catalog(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         user_id = str(event.get_sender_id())
         session_id = self._get_session_id(event)
         catalog = self.store.format_field_catalog(user_id, session_id)
         yield event.plain_result(f"可用画像字段：\n{catalog}")
 
     @filter.command("设置画像")
-    async def set_my_profile(self, event: AstrMessageEvent, field_name: str, value: str) -> None:
+    async def set_my_profile(self, event: AstrMessageEvent, field_name: str, value: str) -> AsyncGenerator[Any, None]:
         user_id = str(event.get_sender_id())
         session_id = self._get_session_id(event)
         allow_custom_field = self._allow_user_custom_fields()
@@ -872,7 +1059,7 @@ class ProfileWeaverPlugin(Star):
         yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
 
     @filter.command("删除画像")
-    async def delete_my_profile(self, event: AstrMessageEvent, field_selector: str) -> None:
+    async def delete_my_profile(self, event: AstrMessageEvent, field_selector: str) -> AsyncGenerator[Any, None]:
         result = self.store.delete_field(
             user_id=str(event.get_sender_id()),
             session_id=self._get_session_id(event),
@@ -884,7 +1071,7 @@ class ProfileWeaverPlugin(Star):
         yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
 
     @filter.command("清空画像")
-    async def clear_my_profile(self, event: AstrMessageEvent) -> None:
+    async def clear_my_profile(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         result = self.store.clear_profile(
             user_id=str(event.get_sender_id()),
             session_id=self._get_session_id(event),
@@ -894,7 +1081,7 @@ class ProfileWeaverPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查询画像")
-    async def admin_query_profile(self, event: AstrMessageEvent, user_id: str) -> None:
+    async def admin_query_profile(self, event: AstrMessageEvent, user_id: str) -> AsyncGenerator[Any, None]:
         target_user_id = self._resolve_admin_target_user_id(event, user_id)
         session_id = self._get_session_id(event)
         summary = self.store.format_profile_summary(target_user_id, session_id)
@@ -914,7 +1101,7 @@ class ProfileWeaverPlugin(Star):
         user_id: str,
         field_name: str,
         value: str,
-    ) -> None:
+    ) -> AsyncGenerator[Any, None]:
         target_user_id = self._resolve_admin_target_user_id(event, user_id)
         session_id = self._get_session_id(event)
         old_profile = self.store.get_profile(target_user_id, session_id)
@@ -940,7 +1127,7 @@ class ProfileWeaverPlugin(Star):
         event: AstrMessageEvent,
         user_id: str,
         field_selector: str,
-    ) -> None:
+    ) -> AsyncGenerator[Any, None]:
         result = self.store.delete_field(
             user_id=self._resolve_admin_target_user_id(event, user_id),
             session_id=self._get_session_id(event),
@@ -953,7 +1140,7 @@ class ProfileWeaverPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("清空用户画像")
-    async def admin_clear_profile(self, event: AstrMessageEvent, user_id: str) -> None:
+    async def admin_clear_profile(self, event: AstrMessageEvent, user_id: str) -> AsyncGenerator[Any, None]:
         result = self.store.clear_profile(
             user_id=self._resolve_admin_target_user_id(event, user_id),
             session_id=self._get_session_id(event),
@@ -968,7 +1155,7 @@ class ProfileWeaverPlugin(Star):
         event: AstrMessageEvent,
         user_id: str,
         limit: int = 10,
-    ) -> None:
+    ) -> AsyncGenerator[Any, None]:
         session_id = self._get_session_id(event)
         entries = self.store.read_recent_audit(
             user_id=self._resolve_admin_target_user_id(event, user_id),
@@ -988,24 +1175,125 @@ class ProfileWeaverPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("画像统计")
-    async def admin_profile_stats(self, event: AstrMessageEvent) -> None:
+    async def admin_profile_stats(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         stats = self.store.collect_stats()
-        user_count = int(stats["user_count"])
-        field_counts = stats["field_counts"]
-        custom_field_counts = stats["custom_field_counts"]
+        profile_count = int(stats.get("profile_count") or stats.get("user_count") or 0)
+        field_counts = stats.get("field_counts", {})
+        custom_field_counts = stats.get("custom_field_counts", {})
 
-        lines = [f"画像用户数：{user_count}", "", "字段覆盖率："]
-        for field_name in self.store.builtin_field_map:
+        lines = [
+            f"画像总数：{profile_count}（独立用户 {int(stats.get('user_count') or 0)}，会话 {int(stats.get('session_count') or 0)}）",
+            f"已填字段：{int(stats.get('filled_field_count') or 0)}，人均 {float(stats.get('avg_fields_per_profile') or 0):.1f} 个",
+            f"近 7 天活跃：{int(stats.get('active_profiles_7d') or 0)}，最后更新：{stats.get('latest_updated_at') or '未知'}",
+            f"数据体积：画像 {self._format_bytes(stats.get('profiles_file_bytes'))}，审计 {self._format_bytes(stats.get('audit_log_bytes'))}",
+            "",
+            "字段覆盖率（Top 10）：",
+        ]
+        ranked = sorted(
+            self.store.builtin_field_map.keys(),
+            key=lambda name: (-int(field_counts.get(name, 0)), name),
+        )
+        for field_name in ranked[:10]:
             count = int(field_counts.get(field_name, 0))
-            ratio = (count / user_count * 100) if user_count else 0.0
+            ratio = (count / profile_count * 100) if profile_count else 0.0
             lines.append(f"- {field_name}：{count} ({ratio:.1f}%)")
 
         if custom_field_counts:
-            lines.extend(["", "自定义字段使用情况："])
-            for field_name, count in sorted(custom_field_counts.items(), key=lambda item: (-item[1], item[0])):
+            lines.extend(["", "自定义字段使用情况（Top 10）："])
+            for field_name, count in sorted(
+                custom_field_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:10]:
                 lines.append(f"- {field_name}：{count}")
 
+        source_counts = stats.get("source_counts") or {}
+        if source_counts:
+            summary = "、".join(
+                f"{name} {count}"
+                for name, count in sorted(source_counts.items(), key=lambda item: -item[1])[:5]
+            )
+            lines.extend(["", f"写入来源：{summary}"])
+
         yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("画像备份")
+    async def admin_create_backup(
+        self,
+        event: AstrMessageEvent,
+        tag: str = "manual",
+    ) -> AsyncGenerator[Any, None]:
+        path = self.store.create_backup(tag)
+        if path is None:
+            yield event.plain_result("❌ 备份失败，请检查数据目录写入权限。")
+            return
+        yield event.plain_result(f"✅ 已创建备份：{path.name}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("画像备份列表")
+    async def admin_list_backups(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
+        backups = self.store.list_backups()
+        if not backups:
+            yield event.plain_result("暂无备份文件。可以先执行「画像备份」。")
+            return
+        lines = [
+            f"- {item['name']}（{self._format_bytes(item.get('size'))}，{item.get('modified_at')}）"
+            for item in backups[:20]
+        ]
+        yield event.plain_result(f"共 {len(backups)} 个备份：\n" + "\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("画像恢复备份")
+    async def admin_restore_backup(
+        self,
+        event: AstrMessageEvent,
+        name: str,
+    ) -> AsyncGenerator[Any, None]:
+        result = self.store.restore_backup(name, self._build_actor(event, "admin_command"))
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("合并画像")
+    async def admin_merge_profiles(
+        self,
+        event: AstrMessageEvent,
+        source_key: str,
+        target_key: str,
+    ) -> AsyncGenerator[Any, None]:
+        result = self.store.merge_profile_records(
+            source_key=source_key,
+            target_key=target_key,
+            actor=self._build_actor(event, "admin_command"),
+        )
+        yield event.plain_result(("✅ " if result.ok else "❌ ") + result.message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("画像面板")
+    async def admin_webui_hint(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
+        if self.web_api is None:
+            yield event.plain_result(
+                "WebUI 未启用。请在插件配置里打开「是否启用 WebUI 画像管理面板」，然后重载插件。"
+            )
+            return
+        stats = self.store.collect_stats()
+        yield event.plain_result(
+            f"{self.DISPLAY_NAME} 面板已就绪：\n"
+            "打开 AstrBot Dashboard → 插件管理 → 心迹画像 → 画像面板。\n"
+            f"当前 {int(stats.get('profile_count') or 0)} 条画像，"
+            f"写操作{'已开启' if self.config.get('webui_allow_edit', True) else '已锁定（只读）'}。\n"
+            "面板接口仅依赖 Dashboard 登录态，请不要把 Dashboard 暴露到公网。"
+        )
+
+    @staticmethod
+    def _format_bytes(raw_size: Any) -> str:
+        try:
+            size = float(raw_size or 0)
+        except (TypeError, ValueError):
+            return "0 B"
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} GB"
 
     async def terminate(self) -> None:
         self._debug("terminate called")

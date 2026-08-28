@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,12 @@ DEFAULT_FIELDS: list[tuple[str, str]] = [
     ("技能水平", "用户主动表达的技能或熟练度"),
     ("健康状况", "用户主动披露且适合长期记忆的健康信息"),
     ("宠物", "宠物相关信息"),
+    ("MBTI", "用户自述的 MBTI 人格类型，例如 INTP"),
+    ("星座", "用户自述的星座"),
+    ("时区", "用户所在时区或习惯作息时区，例如 UTC+8"),
+    ("常用语言", "日常沟通使用的语言，例如中文、英文"),
+    ("沟通偏好", "希望被如何对待的沟通风格，例如简洁、多解释、少表情"),
+    ("禁忌话题", "用户明确要求不要提及的话题"),
     (NOTES_FIELD_NAME, "短期补充备注，会自动保留最近几条"),
 ]
 
@@ -101,6 +109,8 @@ class ProfileStore:
         max_notes_count: int = 5,
         custom_field_name_max_length: int = 16,
         field_value_max_length: int = 160,
+        audit_log_max_mb: float = 8.0,
+        backup_retention_days: int = 14,
     ) -> None:
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -108,12 +118,16 @@ class ProfileStore:
         self.audit_log_path = self.data_dir / "audit_log.jsonl"
         self.legacy_profiles_path = self.data_dir / "user_profiles.json"
         self.migration_state_path = self.data_dir / "migration_state.json"
+        self.backup_dir = self.data_dir / "backups"
         self.max_notes_count = max(1, min(int(max_notes_count), 20))
         self.custom_field_name_max_length = max(4, min(int(custom_field_name_max_length), 32))
         self.field_value_max_length = max(32, min(int(field_value_max_length), 500))
+        self.audit_log_max_bytes = int(max(0.5, min(float(audit_log_max_mb), 128.0)) * 1024 * 1024)
+        self.backup_retention_days = max(1, min(int(backup_retention_days), 180))
         self.builtin_field_map = self._build_builtin_field_map(builtin_fields)
         self.migration_state = self._load_migration_state()
         self.profiles = self._load_profiles()
+        self._last_snapshot_day = ""
 
     @staticmethod
     def now_text() -> str:
@@ -269,18 +283,55 @@ class ProfileStore:
         return result
 
     def _read_json(self, path: Path) -> dict[str, Any]:
+        """Read a JSON object, quarantining (never silently dropping) broken files."""
         if not path.exists():
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
+            raw_text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.error("[ProfileWeaver] 读取 %s 失败：%s", path, exc)
             return {}
+        if not raw_text.strip():
+            return {}
+        try:
+            payload = json.loads(raw_text)
+        except (ValueError, TypeError) as exc:
+            quarantine_path = path.with_name(
+                f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            )
+            try:
+                path.replace(quarantine_path)
+                logger.error(
+                    "[ProfileWeaver] %s 解析失败（%s），已备份为 %s，本次以空数据继续。",
+                    path,
+                    exc,
+                    quarantine_path,
+                )
+            except OSError as backup_exc:
+                logger.error(
+                    "[ProfileWeaver] %s 解析失败且备份失败：%s / %s", path, exc, backup_exc
+                )
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
-    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    def _write_json(self, path: Path, payload: Any) -> None:
+        """Atomic write so a crash mid-save can never truncate the profile file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp_path.replace(path)
+        except OSError as exc:
+            logger.error("[ProfileWeaver] 写入 %s 失败：%s", path, exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _load_migration_state(self) -> dict[str, Any]:
         raw_state = self._read_json(self.migration_state_path)
@@ -731,6 +782,7 @@ class ProfileStore:
 
     def _save_profiles(self) -> None:
         self._write_json(self.profiles_path, self.profiles)
+        self._maybe_snapshot_backup()
 
     def _ensure_profile(
         self,
@@ -931,8 +983,12 @@ class ProfileStore:
             "old_value": self._compact_value(old_value),
             "new_value": self._compact_value(new_value),
         }
-        with self.audit_log_path.open("a", encoding="utf-8") as audit_file:
-            audit_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._rotate_audit_log()
+        try:
+            with self.audit_log_path.open("a", encoding="utf-8") as audit_file:
+                audit_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.error("[ProfileWeaver] 写入审计日志失败：%s", exc)
 
     def _compact_value(self, value: Any) -> str:
         if isinstance(value, list):
@@ -1141,20 +1197,67 @@ class ProfileStore:
         return OperationResult(True, "已清空画像", True)
 
     def collect_stats(self) -> dict[str, Any]:
-        user_count = len(self.profiles)
         field_counts: dict[str, int] = {}
         custom_field_counts: dict[str, int] = {}
-        for record in self.profiles.values():
+        source_counts: dict[str, int] = {}
+        distinct_users: set[str] = set()
+        distinct_sessions: set[str] = set()
+        note_count = 0
+        filled_field_count = 0
+        latest_updated_at = ""
+        active_7d = 0
+        cutoff_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
+        for session_key, record in self.profiles.items():
+            if not isinstance(record, dict):
+                continue
+            session_id, user_id = self.split_profile_key(session_key, record)
+            if user_id:
+                distinct_users.add(user_id)
+            if session_id:
+                distinct_sessions.add(session_id)
+
             fields = record.get("fields", {})
             custom_fields = record.get("custom_fields", {})
-            for field_name in fields:
-                field_counts[field_name] = field_counts.get(field_name, 0) + 1
-                if field_name in custom_fields:
-                    custom_field_counts[field_name] = custom_field_counts.get(field_name, 0) + 1
+            if isinstance(fields, dict):
+                for field_name, value in fields.items():
+                    field_counts[field_name] = field_counts.get(field_name, 0) + 1
+                    filled_field_count += 1
+                    if isinstance(custom_fields, dict) and field_name in custom_fields:
+                        custom_field_counts[field_name] = custom_field_counts.get(field_name, 0) + 1
+                    if field_name == NOTES_FIELD_NAME and isinstance(value, list):
+                        note_count += len(value)
+
+            field_meta = record.get("field_meta", {})
+            if isinstance(field_meta, dict):
+                for metadata in field_meta.values():
+                    if not isinstance(metadata, dict):
+                        continue
+                    source = str(metadata.get("updated_by") or "unknown")
+                    source_counts[source] = source_counts.get(source, 0) + 1
+
+            updated_at = self._coerce_timestamp(record.get("updated_at"))
+            latest_updated_at = self._pick_latest_timestamp(latest_updated_at, updated_at)
+            if updated_at and updated_at >= cutoff_7d:
+                active_7d += 1
+
+        profile_count = len(self.profiles)
         return {
-            "user_count": user_count,
+            "user_count": len(distinct_users) or profile_count,
+            "profile_count": profile_count,
+            "session_count": len(distinct_sessions),
             "field_counts": field_counts,
             "custom_field_counts": custom_field_counts,
+            "source_counts": source_counts,
+            "note_count": note_count,
+            "filled_field_count": filled_field_count,
+            "avg_fields_per_profile": round(filled_field_count / profile_count, 2) if profile_count else 0.0,
+            "latest_updated_at": latest_updated_at,
+            "active_profiles_7d": active_7d,
+            "audit_log_bytes": self.audit_log_path.stat().st_size if self.audit_log_path.exists() else 0,
+            "profiles_file_bytes": self.profiles_path.stat().st_size if self.profiles_path.exists() else 0,
+            "builtin_field_count": len(self.builtin_field_map),
+            "custom_field_kind_count": len(custom_field_counts),
         }
 
     def read_recent_audit(
@@ -1179,3 +1282,634 @@ class ProfileStore:
                     continue
                 matched.append(entry)
         return list(reversed(matched))
+
+    # ------------------------------------------------------------------
+    # 键解析 / 公共小工具
+    # ------------------------------------------------------------------
+    def split_profile_key(self, session_key: str, record: dict[str, Any] | None = None) -> tuple[str, str]:
+        """Split a storage key back into (session_id, user_id)."""
+        record = record if isinstance(record, dict) else (self.profiles.get(session_key) or {})
+        user_id = str(record.get("subject_user_id") or self._extract_user_id_from_key(session_key)).strip()
+        if not user_id:
+            return "", session_key
+        suffix = f"_{user_id}"
+        if session_key.endswith(suffix) and len(session_key) > len(suffix):
+            return session_key[: -len(suffix)], user_id
+        return "", user_id
+
+    def extract_conflict_tokens(self, raw_value: Any) -> list[tuple[str, str]]:
+        """Public wrapper so callers do not need to touch a private helper."""
+        return self._extract_conflict_tokens(raw_value)
+
+    @staticmethod
+    def describe_session(session_id: str) -> dict[str, str]:
+        """Best-effort split of an AstrBot unified_msg_origin for display purposes."""
+        raw = str(session_id or "").strip()
+        if not raw:
+            return {"platform": "", "chat_type": "global", "chat_id": ""}
+        parts = raw.split(":")
+        platform = parts[0] if parts else ""
+        message_type = parts[1] if len(parts) > 1 else ""
+        chat_id = parts[2] if len(parts) > 2 else ""
+        lowered = message_type.casefold()
+        if "group" in lowered:
+            chat_type = "group"
+        elif "friend" in lowered or "private" in lowered:
+            chat_type = "private"
+        else:
+            chat_type = message_type or "unknown"
+        return {"platform": platform, "chat_type": chat_type, "chat_id": chat_id}
+
+    def primary_display_name(self, record: dict[str, Any]) -> str:
+        fields = record.get("fields", {}) if isinstance(record, dict) else {}
+        if isinstance(fields, dict):
+            for field_name in PROFILE_NAME_FIELD_NAMES:
+                value = fields.get(field_name)
+                if isinstance(value, list):
+                    value = value[0] if value else ""
+                text = str(value or "").strip()
+                if text:
+                    return text
+        subject_name = str(record.get("subject_name") or "").strip()
+        if subject_name:
+            return subject_name
+        return str(record.get("subject_user_id") or "").strip()
+
+    # ------------------------------------------------------------------
+    # 备份与日志维护
+    # ------------------------------------------------------------------
+    def _maybe_snapshot_backup(self) -> None:
+        """Keep one automatic snapshot per day so a bad import stays recoverable."""
+        today = datetime.now().strftime("%Y%m%d")
+        if getattr(self, "_last_snapshot_day", "") == today:
+            return
+        self._last_snapshot_day = today
+        snapshot_path = self.backup_dir / f"profiles-auto-{today}.json"
+        if snapshot_path.exists():
+            self._prune_backups()
+            return
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            self._write_json(snapshot_path, self.profiles)
+        except OSError as exc:
+            logger.warning("[ProfileWeaver] 自动备份失败：%s", exc)
+            return
+        self._prune_backups()
+
+    def create_backup(self, tag: str = "manual") -> Path | None:
+        safe_tag = re.sub(r"[^A-Za-z0-9_\-]+", "-", str(tag or "manual")).strip("-") or "manual"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = self.backup_dir / f"profiles-{safe_tag}-{stamp}.json"
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            self._write_json(target, self.profiles)
+        except OSError as exc:
+            logger.warning("[ProfileWeaver] 创建备份失败：%s", exc)
+            return None
+        self._prune_backups()
+        return target
+
+    def _prune_backups(self) -> None:
+        if not self.backup_dir.exists():
+            return
+        cutoff = datetime.now() - timedelta(days=self.backup_retention_days)
+        for path in self.backup_dir.glob("profiles-*.json"):
+            try:
+                if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def list_backups(self) -> list[dict[str, Any]]:
+        if not self.backup_dir.exists():
+            return []
+        items: list[dict[str, Any]] = []
+        for path in sorted(self.backup_dir.glob("profiles-*.json"), reverse=True):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            items.append(
+                {
+                    "name": path.name,
+                    "size": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        return items
+
+    def restore_backup(self, name: str, actor: AuditActor) -> OperationResult:
+        safe_name = Path(str(name or "")).name
+        if not safe_name or not safe_name.startswith("profiles-") or not safe_name.endswith(".json"):
+            return OperationResult(False, "备份文件名不合法")
+        source = self.backup_dir / safe_name
+        if not source.exists():
+            return OperationResult(False, f"备份 {safe_name} 不存在")
+        payload = self._read_json(source)
+        if not isinstance(payload, dict):
+            return OperationResult(False, "备份内容无法解析")
+        self.create_backup("pre-restore")
+        restored = self._normalize_profiles_payload(payload)
+        self.profiles = restored
+        self._save_profiles()
+        self._append_audit(
+            action="restore_backup",
+            user_id="*",
+            subject_name="",
+            session_id=None,
+            actor=actor,
+            field_name="*",
+            source_kind="backup_restore",
+            evidence=safe_name,
+            old_value="",
+            new_value=f"{len(restored)} profiles",
+        )
+        return OperationResult(True, f"已从 {safe_name} 恢复 {len(restored)} 条画像", True)
+
+    def _rotate_audit_log(self) -> None:
+        if not self.audit_log_path.exists():
+            return
+        try:
+            if self.audit_log_path.stat().st_size < self.audit_log_max_bytes:
+                return
+        except OSError:
+            return
+        rotated = self.audit_log_path.with_name(
+            f"{self.audit_log_path.name}.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+        try:
+            shutil.move(str(self.audit_log_path), str(rotated))
+            logger.info("[ProfileWeaver] 审计日志已轮转为 %s", rotated.name)
+        except OSError as exc:
+            logger.warning("[ProfileWeaver] 审计日志轮转失败：%s", exc)
+
+    # ------------------------------------------------------------------
+    # 面向 WebUI 的查询接口
+    # ------------------------------------------------------------------
+    def summarize_profile(self, session_key: str, record: dict[str, Any]) -> dict[str, Any]:
+        session_id, user_id = self.split_profile_key(session_key, record)
+        fields = record.get("fields", {}) if isinstance(record, dict) else {}
+        custom_fields = record.get("custom_fields", {}) if isinstance(record, dict) else {}
+        fields = fields if isinstance(fields, dict) else {}
+        custom_fields = custom_fields if isinstance(custom_fields, dict) else {}
+        notes = fields.get(NOTES_FIELD_NAME)
+        note_count = len(notes) if isinstance(notes, list) else (1 if notes else 0)
+
+        preview: list[dict[str, str]] = []
+        for field_name in self.builtin_field_map:
+            if field_name == NOTES_FIELD_NAME or field_name not in fields:
+                continue
+            preview.append({"name": field_name, "value": self._compact_value(fields[field_name])})
+            if len(preview) >= 4:
+                break
+        if len(preview) < 4:
+            for field_name in custom_fields:
+                if field_name not in fields:
+                    continue
+                preview.append({"name": field_name, "value": self._compact_value(fields[field_name])})
+                if len(preview) >= 4:
+                    break
+
+        session_info = self.describe_session(session_id)
+        return {
+            "key": session_key,
+            "user_id": user_id,
+            "session_id": session_id,
+            "subject_name": str(record.get("subject_name") or ""),
+            "display_name": self.primary_display_name(record),
+            "platform": session_info["platform"],
+            "chat_type": session_info["chat_type"],
+            "field_count": len([name for name in fields if name != NOTES_FIELD_NAME]),
+            "custom_field_count": len([name for name in custom_fields if name in fields]),
+            "note_count": note_count,
+            "created_at": str(record.get("created_at") or ""),
+            "updated_at": str(record.get("updated_at") or ""),
+            "preview": preview,
+        }
+
+    def list_profiles(
+        self,
+        *,
+        query: str = "",
+        chat_type: str = "all",
+        platform: str = "all",
+        field: str = "",
+        sort: str = "updated_desc",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        keyword = str(query or "").strip().casefold()
+        wanted_field = self.canonical_field_name(field) if field else ""
+        rows: list[dict[str, Any]] = []
+
+        for session_key, record in self.profiles.items():
+            if not isinstance(record, dict):
+                continue
+            summary = self.summarize_profile(session_key, record)
+            if chat_type not in ("", "all") and summary["chat_type"] != chat_type:
+                continue
+            if platform not in ("", "all") and summary["platform"] != platform:
+                continue
+            fields = record.get("fields", {})
+            if wanted_field and wanted_field not in (fields if isinstance(fields, dict) else {}):
+                continue
+            if keyword:
+                haystack = " ".join(
+                    [
+                        session_key,
+                        summary["user_id"],
+                        summary["subject_name"],
+                        summary["display_name"],
+                        summary["session_id"],
+                        json.dumps(fields, ensure_ascii=False) if isinstance(fields, dict) else "",
+                    ]
+                ).casefold()
+                if keyword not in haystack:
+                    continue
+            rows.append(summary)
+
+        reverse = not sort.endswith("_asc")
+        if sort.startswith("fields"):
+            rows.sort(key=lambda item: (item["field_count"], item["updated_at"]), reverse=reverse)
+        elif sort.startswith("created"):
+            rows.sort(key=lambda item: item["created_at"], reverse=reverse)
+        elif sort.startswith("name"):
+            rows.sort(key=lambda item: item["display_name"].casefold(), reverse=reverse)
+        else:
+            rows.sort(key=lambda item: item["updated_at"], reverse=reverse)
+
+        total = len(rows)
+        page_size = max(1, min(int(page_size or 20), 200))
+        page_count = max(1, (total + page_size - 1) // page_size)
+        page = max(1, min(int(page or 1), page_count))
+        start = (page - 1) * page_size
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "page_count": page_count,
+            "items": rows[start : start + page_size],
+        }
+
+    def list_platforms(self) -> list[str]:
+        platforms: set[str] = set()
+        for session_key, record in self.profiles.items():
+            if not isinstance(record, dict):
+                continue
+            session_id, _ = self.split_profile_key(session_key, record)
+            platform = self.describe_session(session_id)["platform"]
+            if platform:
+                platforms.add(platform)
+        return sorted(platforms)
+
+    def get_profile_detail(self, session_key: str) -> dict[str, Any]:
+        record = self.profiles.get(session_key)
+        if not isinstance(record, dict):
+            return {}
+        session_id, user_id = self.split_profile_key(session_key, record)
+        fields = record.get("fields", {}) if isinstance(record.get("fields"), dict) else {}
+        custom_fields = record.get("custom_fields", {}) if isinstance(record.get("custom_fields"), dict) else {}
+        field_meta = record.get("field_meta", {}) if isinstance(record.get("field_meta"), dict) else {}
+
+        ordered_names: list[str] = [
+            name for name in self.builtin_field_map if name != NOTES_FIELD_NAME and name in fields
+        ]
+        ordered_names.extend(name for name in custom_fields if name in fields and name not in ordered_names)
+        ordered_names.extend(
+            name
+            for name in fields
+            if name != NOTES_FIELD_NAME and name not in ordered_names
+        )
+
+        entries: list[dict[str, Any]] = []
+        for field_name in ordered_names:
+            metadata = field_meta.get(field_name, {}) if isinstance(field_meta.get(field_name), dict) else {}
+            entries.append(
+                {
+                    "name": field_name,
+                    "value": fields[field_name],
+                    "is_custom": field_name in custom_fields,
+                    "description": str((custom_fields.get(field_name) or {}).get("description") or "")
+                    if field_name in custom_fields
+                    else self.builtin_field_map.get(field_name, ""),
+                    "updated_at": str(metadata.get("updated_at") or ""),
+                    "updated_by": str(metadata.get("updated_by") or ""),
+                    "actor_name": str(metadata.get("actor_name") or ""),
+                    "source_kind": str(metadata.get("source_kind") or ""),
+                    "evidence": str(metadata.get("evidence") or ""),
+                }
+            )
+
+        raw_notes = fields.get(NOTES_FIELD_NAME)
+        notes = raw_notes if isinstance(raw_notes, list) else ([str(raw_notes)] if raw_notes else [])
+        notes_meta = field_meta.get(NOTES_FIELD_NAME, {}) if isinstance(field_meta.get(NOTES_FIELD_NAME), dict) else {}
+        session_info = self.describe_session(session_id)
+
+        return {
+            "key": session_key,
+            "user_id": user_id,
+            "session_id": session_id,
+            "platform": session_info["platform"],
+            "chat_type": session_info["chat_type"],
+            "subject_name": str(record.get("subject_name") or ""),
+            "display_name": self.primary_display_name(record),
+            "created_at": str(record.get("created_at") or ""),
+            "updated_at": str(record.get("updated_at") or ""),
+            "fields": entries,
+            "notes": notes,
+            "notes_meta": {
+                "updated_at": str(notes_meta.get("updated_at") or ""),
+                "updated_by": str(notes_meta.get("updated_by") or ""),
+            },
+            "summary": self.format_profile_summary(user_id, session_id or None),
+        }
+
+    def delete_profile_by_key(self, session_key: str, actor: AuditActor) -> OperationResult:
+        record = self.profiles.get(session_key)
+        if not isinstance(record, dict):
+            return OperationResult(False, "画像不存在")
+        session_id, user_id = self.split_profile_key(session_key, record)
+        old_fields = record.get("fields", {})
+        subject_name = str(record.get("subject_name") or "")
+        self.profiles.pop(session_key, None)
+        self._save_profiles()
+        self._append_audit(
+            action="clear_profile",
+            user_id=user_id,
+            subject_name=subject_name,
+            session_id=session_id or None,
+            actor=actor,
+            field_name="*",
+            source_kind="webui_delete",
+            evidence="",
+            old_value=old_fields,
+            new_value="",
+        )
+        return OperationResult(True, f"已删除画像 {session_key}", True)
+
+    def merge_profile_records(
+        self,
+        *,
+        source_key: str,
+        target_key: str,
+        actor: AuditActor,
+        drop_source: bool = True,
+    ) -> OperationResult:
+        if source_key == target_key:
+            return OperationResult(False, "源画像与目标画像相同")
+        source = self.profiles.get(source_key)
+        if not isinstance(source, dict):
+            return OperationResult(False, f"源画像 {source_key} 不存在")
+        target = self.profiles.get(target_key)
+        self.create_backup("pre-merge")
+
+        if not isinstance(target, dict):
+            session_id, user_id = self.split_profile_key(target_key, {})
+            merged = json.loads(json.dumps(source, ensure_ascii=False))
+            merged["subject_user_id"] = user_id or merged.get("subject_user_id")
+            self.profiles[target_key] = merged
+        else:
+            merged, _ = self._merge_profile_record(target, source)
+            merged["subject_user_id"] = target.get("subject_user_id") or merged.get("subject_user_id")
+            self.profiles[target_key] = merged
+
+        if drop_source:
+            self.profiles.pop(source_key, None)
+        self._save_profiles()
+
+        target_session_id, target_user_id = self.split_profile_key(target_key, self.profiles.get(target_key, {}))
+        self._append_audit(
+            action="merge_profile",
+            user_id=target_user_id,
+            subject_name=str(self.profiles.get(target_key, {}).get("subject_name") or ""),
+            session_id=target_session_id or None,
+            actor=actor,
+            field_name="*",
+            source_kind="profile_merge",
+            evidence=f"{source_key} -> {target_key}",
+            old_value=source_key,
+            new_value=target_key,
+        )
+        return OperationResult(True, f"已把 {source_key} 合并进 {target_key}", True)
+
+    def read_audit(
+        self,
+        *,
+        user_id: str = "",
+        session_id: str | None = None,
+        action: str = "",
+        actor_type: str = "",
+        query: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        if not self.audit_log_path.exists():
+            return {"total": 0, "items": [], "offset": 0, "limit": limit}
+
+        keyword = str(query or "").strip().casefold()
+        matched: list[dict[str, Any]] = []
+        try:
+            with self.audit_log_path.open("r", encoding="utf-8") as audit_file:
+                for line in audit_file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if user_id and str(entry.get("subject_user_id") or "") != str(user_id):
+                        continue
+                    if session_id is not None and str(entry.get("session_id") or "") != str(session_id or ""):
+                        continue
+                    if action and str(entry.get("action") or "") != action:
+                        continue
+                    if actor_type and str(entry.get("actor_type") or "") != actor_type:
+                        continue
+                    if keyword and keyword not in json.dumps(entry, ensure_ascii=False).casefold():
+                        continue
+                    matched.append(entry)
+        except OSError as exc:
+            logger.warning("[ProfileWeaver] 读取审计日志失败：%s", exc)
+            return {"total": 0, "items": [], "offset": 0, "limit": limit}
+
+        matched.reverse()
+        total = len(matched)
+        limit = max(1, min(int(limit or 50), 500))
+        offset = max(0, min(int(offset or 0), total))
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "items": matched[offset : offset + limit],
+        }
+
+    def audit_action_catalog(self) -> list[str]:
+        return [
+            "upsert_field",
+            "append_note",
+            "delete_field",
+            "delete_note",
+            "clear_profile",
+            "merge_profile",
+            "import_bundle",
+            "restore_backup",
+        ]
+
+    # ------------------------------------------------------------------
+    # 导入 / 导出
+    # ------------------------------------------------------------------
+    BUNDLE_FORMAT = "profileweaver.bundle"
+    BUNDLE_VERSION = 2
+
+    @staticmethod
+    def _mask_id(raw_id: str) -> str:
+        text = str(raw_id or "")
+        if len(text) <= 4:
+            return "*" * len(text)
+        return f"{text[:2]}{'*' * (len(text) - 4)}{text[-2:]}"
+
+    def export_bundle(
+        self,
+        *,
+        keys: list[str] | None = None,
+        include_audit: bool = False,
+        audit_limit: int = 500,
+        mask_user_ids: bool = False,
+    ) -> dict[str, Any]:
+        selected_keys = [key for key in (keys or list(self.profiles)) if key in self.profiles]
+        profiles: dict[str, Any] = {}
+        for session_key in selected_keys:
+            record = json.loads(json.dumps(self.profiles[session_key], ensure_ascii=False))
+            if mask_user_ids:
+                session_id, user_id = self.split_profile_key(session_key, record)
+                masked_user_id = self._mask_id(user_id)
+                record["subject_user_id"] = masked_user_id
+                record["subject_name"] = self._mask_id(str(record.get("subject_name") or ""))
+                # 字段元数据里也记着写入者身份，同样要脱敏，否则 actor_id 会把原始 ID 漏出去。
+                field_meta = record.get("field_meta")
+                if isinstance(field_meta, dict):
+                    for meta in field_meta.values():
+                        if not isinstance(meta, dict):
+                            continue
+                        if meta.get("actor_id"):
+                            meta["actor_id"] = self._mask_id(str(meta["actor_id"]))
+                        if meta.get("actor_name"):
+                            meta["actor_name"] = self._mask_id(str(meta["actor_name"]))
+                notes_meta = record.get("notes_meta")
+                if isinstance(notes_meta, dict):
+                    if notes_meta.get("actor_id"):
+                        notes_meta["actor_id"] = self._mask_id(str(notes_meta["actor_id"]))
+                    if notes_meta.get("actor_name"):
+                        notes_meta["actor_name"] = self._mask_id(str(notes_meta["actor_name"]))
+                session_key = f"{session_id}_{masked_user_id}" if session_id else masked_user_id
+            profiles[session_key] = record
+
+        bundle: dict[str, Any] = {
+            "format": self.BUNDLE_FORMAT,
+            "version": self.BUNDLE_VERSION,
+            "plugin": "astrbot_plugin_profile_weaver",
+            "exported_at": self.now_text(),
+            "masked": bool(mask_user_ids),
+            "builtin_fields": list(self.builtin_field_map.keys()),
+            "profile_count": len(profiles),
+            "profiles": profiles,
+        }
+        if include_audit:
+            entries = self.read_audit(limit=max(1, min(int(audit_limit), 500)))["items"]
+            if mask_user_ids:
+                for entry in entries:
+                    for key_name in ("subject_user_id", "subject_name", "actor_id", "actor_name"):
+                        if entry.get(key_name):
+                            entry[key_name] = self._mask_id(str(entry[key_name]))
+            bundle["audit"] = entries
+        return bundle
+
+    def import_bundle(
+        self,
+        payload: Any,
+        *,
+        mode: str = "merge",
+        actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError as exc:
+                return {"ok": False, "message": f"JSON 解析失败：{exc}"}
+        if not isinstance(payload, dict):
+            return {"ok": False, "message": "导入内容必须是 JSON 对象"}
+
+        raw_profiles = payload.get("profiles")
+        if not isinstance(raw_profiles, dict):
+            candidate = {
+                key: value
+                for key, value in payload.items()
+                if isinstance(value, dict) and not str(key).startswith("_")
+            }
+            raw_profiles = candidate
+        if not raw_profiles:
+            return {"ok": False, "message": "没有找到可导入的画像数据"}
+
+        normalized_mode = str(mode or "merge").strip().lower()
+        if normalized_mode not in {"merge", "overwrite", "replace"}:
+            return {"ok": False, "message": f"未知导入模式：{mode}"}
+
+        if payload.get("masked"):
+            return {
+                "ok": False,
+                "message": "该备份导出时开启了脱敏，用户 ID 已不可逆，无法导入。请使用未脱敏的备份文件。",
+            }
+
+        incoming = self._normalize_profiles_payload(raw_profiles)
+        if not incoming:
+            return {"ok": False, "message": "导入内容无法解析为有效画像"}
+
+        backup_path = self.create_backup(f"pre-import-{normalized_mode}")
+        before_keys = set(self.profiles)
+
+        if normalized_mode == "replace":
+            self.profiles = incoming
+        elif normalized_mode == "overwrite":
+            merged = dict(self.profiles)
+            merged.update(incoming)
+            self.profiles = merged
+        else:
+            self.profiles, _ = self._merge_profiles(self.profiles, incoming)
+
+        self._save_profiles()
+
+        after_keys = set(self.profiles)
+        created = len(after_keys - before_keys)
+        removed = len(before_keys - after_keys)
+        updated = len([key for key in incoming if key in before_keys])
+
+        if actor is not None:
+            self._append_audit(
+                action="import_bundle",
+                user_id="*",
+                subject_name="",
+                session_id=None,
+                actor=actor,
+                field_name="*",
+                source_kind=f"import_{normalized_mode}",
+                evidence=str(payload.get("exported_at") or "")[:160],
+                old_value=f"{len(before_keys)} profiles",
+                new_value=f"{len(after_keys)} profiles",
+            )
+
+        return {
+            "ok": True,
+            "message": (
+                f"导入完成（{normalized_mode}）：新增 {created}，更新 {updated}，"
+                f"移除 {removed}，当前共 {len(after_keys)} 条画像。"
+            ),
+            "mode": normalized_mode,
+            "created": created,
+            "updated": updated,
+            "removed": removed,
+            "total": len(after_keys),
+            "backup": backup_path.name if backup_path else "",
+        }
