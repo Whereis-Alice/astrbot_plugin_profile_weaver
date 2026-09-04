@@ -46,6 +46,9 @@ const ICONS = {
   clock: ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18", "M12 7.4V12l3.2 2"],
   db: ["M12 3.4c4.4 0 8 1.2 8 2.6S16.4 8.6 12 8.6 4 7.4 4 6s3.6-2.6 8-2.6", "M4 6v12c0 1.4 3.6 2.6 8 2.6s8-1.2 8-2.6V6", "M4 12c0 1.4 3.6 2.6 8 2.6s8-1.2 8-2.6"],
   ghost: ["M4.6 20V10.6a7.4 7.4 0 0 1 14.8 0V20l-2.5-1.8L14.4 20 12 18.2 9.6 20 7.1 18.2z", "M9.6 10.4h.02", "M14.4 10.4h.02"],
+  unlock: ["M6.4 10.6h11.2V20H6.4z", "M8.8 10.6V7.8a3.2 3.2 0 0 1 6.2-1"],
+  sheet: ["M4.4 4h15.2v16H4.4z", "M4.4 9.4h15.2", "M4.4 14.6h15.2", "M10.2 4v16"],
+  target: ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18", "M12 16.6a4.6 4.6 0 1 0 0-9.2 4.6 4.6 0 0 0 0 9.2", "M12 13.2a1.2 1.2 0 1 0 0-2.4 1.2 1.2 0 0 0 0 2.4"],
 };
 
 function icon(name, className) {
@@ -168,11 +171,16 @@ const chatTypeText = (value) => CHAT_TYPE_TEXT[value] || value || "未知";
 
 const SOURCE_TEXT = {
   llm: "LLM 提取",
+  llm_tool: "LLM 工具",
+  auto_extract: "自动抽取",
   user: "用户操作",
+  user_command: "用户指令",
   admin: "管理员",
+  admin_command: "管理员指令",
   webui: "WebUI",
   system: "系统",
   import: "导入",
+  field_lock: "字段锁",
   unknown: "未知",
 };
 const sourceText = (value) => SOURCE_TEXT[value] || value || "未知";
@@ -182,10 +190,13 @@ const ACTION_TEXT = {
   append_note: "追加备注",
   delete_field: "删除字段",
   delete_note: "删除备注",
+  lock_field: "锁定字段",
+  unlock_field: "解锁字段",
   clear_profile: "清空画像",
   merge_profile: "合并画像",
   import_bundle: "导入数据",
   restore_backup: "恢复备份",
+  delete_backup: "删除备份",
 };
 const actionText = (value) => ACTION_TEXT[value] || value || "—";
 
@@ -269,11 +280,19 @@ const state = {
   coverage: [],
   customFields: [],
   list: { items: [], total: 0, page: 1, page_size: 12, page_count: 1 },
-  filters: { query: "", platform: "all", chat_type: "all", field: "", sort: "updated_desc" },
+  filters: {
+    query: "",
+    platform: "all",
+    chat_type: "all",
+    field: "",
+    sort: "updated_desc",
+    locked_only: false,
+  },
   selected: new Set(),
   detail: null,
+  history: { field: "", items: [], loading: false, total: 0 },
   audit: { items: [], total: 0, offset: 0, limit: 50 },
-  auditFilters: { query: "", action: "", actor_type: "", user_id: "" },
+  auditFilters: { query: "", action: "", actor_type: "", user_id: "", include_rotated: false },
   backups: [],
   exportOptions: { include_audit: false, mask: false, selection_only: false },
   importMode: "merge",
@@ -432,6 +451,33 @@ function metric(label, value, extra) {
   );
 }
 
+/** 画像完整度进度条：低 / 中 / 高三档配色，随主题变量走。 */
+function completenessBar(value, options) {
+  const opts = options || {};
+  const pct = Math.max(0, Math.min(100, Number(value) || 0));
+  const level = pct >= 70 ? "high" : pct >= 35 ? "mid" : "low";
+  return h(
+    "div",
+    {
+      class: "pw-meter" + (opts.slim ? " pw-meter--slim" : ""),
+      title: "画像完整度 " + pct.toFixed(1) + "%" + (opts.hint ? " · " + opts.hint : ""),
+    },
+    opts.label ? h("span", { class: "pw-meter-label", text: opts.label }) : null,
+    h(
+      "div",
+      { class: "pw-meter-track" },
+      h("div", { class: "pw-meter-fill is-" + level, style: { width: pct + "%" } }),
+    ),
+    opts.hideValue ? null : h("span", { class: "pw-meter-val mono", text: pct.toFixed(0) + "%" }),
+  );
+}
+
+function switchControl(checked, label, onChange, title) {
+  const box = h("input", { type: "checkbox", checked: checked ? true : null });
+  box.onchange = () => onChange(box.checked);
+  return h("label", { class: "pw-switch", title: title || label }, box, h("span", { text: label }));
+}
+
 function notice(text, kind, iconName) {
   return h(
     "div",
@@ -507,7 +553,7 @@ function renderHeader() {
   const hint = $("pw-mode-hint");
   if (title) title.textContent = meta.display_name || "心迹画像";
   if (subtitle) subtitle.textContent = meta.subtitle || "Profile Weaver";
-  if (version) version.textContent = "v" + (meta.version || "3.0.0");
+  if (version) version.textContent = "v" + (meta.version || "3.1.0");
   if (hint) hint.textContent = canEdit() ? "画像管理面板" : "只读模式";
   document.title = (meta.display_name || "心迹画像") + " · " + (meta.subtitle || "Profile Weaver");
 }
@@ -528,6 +574,11 @@ function renderStatus() {
       h("span", { class: "mono", text: fmtNum(stats.session_count || 0) }),
       h("span", null, " · 备注 "),
       h("span", { class: "mono", text: fmtNum(stats.note_count || 0) }),
+      h("span", null, " · 完整度 "),
+      h("span", { class: "mono", text: (Number(stats.avg_completeness || 0)).toFixed(0) + "%" }),
+      Number(stats.locked_field_count || 0)
+        ? [h("span", null, " · 锁定 "), h("span", { class: "mono", text: fmtNum(stats.locked_field_count) })]
+        : null,
       canEdit() ? null : h("span", null, " · 只读"),
     );
   }
@@ -538,7 +589,7 @@ function renderStatus() {
       h("span", { text: (current && current.label) || "总览" }),
       h("span", { text: " · " }),
       h("span", { text: meta.plugin || "astrbot_plugin_profile_weaver" }),
-      h("span", { text: " · v" + (meta.version || "3.0.0") }),
+      h("span", { text: " · v" + (meta.version || "3.1.0") }),
     );
   }
 }
@@ -564,7 +615,7 @@ function renderOverview() {
     h(
       "div",
       { class: "pw-hero-tail" },
-      h("span", { class: "pw-chip pw-chip--accent", text: "v" + (meta.version || "3.0.0") }),
+      h("span", { class: "pw-chip pw-chip--accent", text: "v" + (meta.version || "3.1.0") }),
       h("span", { class: "pw-chip", text: fmtNum(stats.profile_count || 0) + " 条画像" }),
       h("span", { class: "pw-chip", text: (meta.builtin_fields || []).length + " 个内置字段" }),
       h("span", { class: "pw-chip", text: ((meta.themes || []).length || 7) + " 套主题" }),
@@ -588,6 +639,16 @@ function renderOverview() {
     metric("ACTIVE 7D", fmtNum(stats.active_profiles_7d || 0), "近 7 天有更新"),
     metric("SESSIONS", fmtNum(stats.session_count || 0), (meta.session_based ? "会话隔离" : "全局共享")),
     metric("CUSTOM", fmtNum(stats.custom_field_kind_count || 0), "种自定义字段"),
+    metric(
+      "COMPLETENESS",
+      (Number(stats.avg_completeness || 0)).toFixed(1) + "%",
+      "平均画像完整度",
+    ),
+    metric(
+      "LOCKED",
+      fmtNum(stats.locked_field_count || 0),
+      fmtNum(stats.locked_profile_count || 0) + " 条画像有锁",
+    ),
   );
 
   const coverage = state.coverage || [];
@@ -629,11 +690,14 @@ function renderOverview() {
     { tools: [iconBtn("refresh", "刷新统计", (event) => guard(event.currentTarget, () => loadStats()))] },
     kv([
       ["画像文件", fmtBytes(stats.profiles_file_bytes || 0)],
-      ["审计日志", fmtBytes(stats.audit_log_bytes || 0)],
+      ["审计日志", fmtBytes(stats.audit_log_bytes || 0) + "（另有 " + fmtNum(stats.audit_rotated_count || 0) + " 份归档）"],
+      ["本地快照", fmtNum(stats.backup_count || 0) + " 份 · 上限 " + fmtNum(meta.backup_max_count || 60) + " 份"],
+      ["近 30 天活跃", fmtNum(stats.active_profiles_30d || 0) + " 条画像有更新"],
       ["最近更新", stats.latest_updated_at ? stats.latest_updated_at + "（" + relTime(stats.latest_updated_at) + "）" : "—"],
       ["会话隔离", meta.session_based ? "已开启（同一用户在不同会话独立成档）" : "已关闭（全局共享一份画像）"],
       ["LLM 工具", meta.llm_tools_enabled ? "已开启" : "已关闭"],
       ["被动提取", meta.proactive_extraction ? "已开启" : "已关闭"],
+      ["字段锁范围", stats.field_lock_scope_label || meta.field_lock_scope_label || "—"],
       ["WebUI 写权限", canEdit() ? "已开启" : "只读"],
       ["服务器时间", meta.server_time || "—"],
     ]),
@@ -680,6 +744,9 @@ function renderOverview() {
       ["单字段长度上限", (meta.field_value_max_length || 160) + " 字"],
       ["备注条数上限", (meta.max_notes_count || 5) + " 条"],
       ["LLM 禁写字段", denylist.length ? denylist.join("、") : "（无）"],
+      ["字段锁范围", meta.field_lock_scope_label || "—"],
+      ["群聊查看他人画像", meta.allow_profile_in_group ? "允许" : "禁止（默认）"],
+      ["身份护栏", meta.strict_identity_guard ? "严格模式" : "宽松模式"],
       ["导出默认脱敏", meta.export_mask_default ? "开启" : "关闭"],
     ]),
   );
@@ -702,6 +769,9 @@ const SORT_OPTIONS = [
   ["created_asc", "最早建档"],
   ["fields_desc", "字段最多"],
   ["fields_asc", "字段最少"],
+  ["completeness_desc", "完整度高→低"],
+  ["completeness_asc", "完整度低→高"],
+  ["locked_desc", "锁定字段最多"],
   ["name_asc", "名称 A→Z"],
   ["name_desc", "名称 Z→A"],
 ];
@@ -781,6 +851,15 @@ function renderLibrary() {
           loadProfiles(1);
         },
         { title: "每页数量" },
+      ),
+      switchControl(
+        filters.locked_only,
+        "只看有锁",
+        (checked) => {
+          filters.locked_only = checked;
+          loadProfiles(1);
+        },
+        "只显示至少有一个字段被锁定的画像",
       ),
       textBtn("check", state.selected.size ? "已选 " + state.selected.size : "全选本页", () => toggleSelectPage()),
       textBtn(
@@ -881,7 +960,19 @@ function profileCard(item) {
       h("span", { class: "pw-pill", text: item.field_count + " 字段" }),
       item.note_count ? h("span", { class: "pw-pill", text: item.note_count + " 备注" }) : null,
       item.custom_field_count ? h("span", { class: "pw-pill pw-pill--warn", text: item.custom_field_count + " 自定义" }) : null,
+      item.locked_count
+        ? h(
+            "span",
+            {
+              class: "pw-pill pw-pill--lock",
+              title: "已锁定字段：" + ((item.locked_fields || []).join("、") || "—"),
+            },
+            icon("lock", "pw-pill-icon"),
+            h("span", { text: item.locked_count + " 锁定" }),
+          )
+        : null,
     ),
+    completenessBar(item.completeness, { slim: true, hint: item.field_count + " 个字段已填" }),
     (item.preview || []).length
       ? h(
           "div",
@@ -919,6 +1010,7 @@ async function loadProfiles(page) {
       chat_type: filters.chat_type,
       field: filters.field,
       sort: filters.sort,
+      locked_only: filters.locked_only ? "1" : "0",
       page: target,
       page_size: state.list.page_size,
     });
@@ -958,6 +1050,7 @@ async function deleteSelected() {
 
 function closeDrawer() {
   state.detail = null;
+  state.history = { field: "", items: [], loading: false, total: 0 };
   const drawer = $("pw-drawer");
   const mask = $("pw-mask");
   if (drawer) {
@@ -971,6 +1064,9 @@ function closeDrawer() {
 async function openDetail(key) {
   try {
     const data = await apiGet("profile", { key: key });
+    if (!state.detail || state.detail.key !== key) {
+      state.history = { field: "", items: [], loading: false, total: 0 };
+    }
     state.detail = data.profile || null;
     renderDrawer();
     renderLibrary();
@@ -989,14 +1085,109 @@ async function refreshDetail(fromResponse) {
   if (state.detail) await openDetail(state.detail.key);
 }
 
+/** 字段改动历史折叠面板（配合 state.history 使用）。 */
+function fieldHistoryPanel(entry) {
+  const hist = state.history;
+  if (hist.loading) {
+    return h(
+      "div",
+      { class: "pw-history" },
+      h("div", { class: "pw-history-empty" }, h("span", { class: "pw-spinner" }), h("span", { text: "正在读取改动历史…" })),
+    );
+  }
+  if (!hist.items.length) {
+    return h(
+      "div",
+      { class: "pw-history" },
+      h("div", { class: "pw-history-empty" }, icon("history"), h("span", { text: "没有找到该字段的审计记录（可能早于日志归档保留范围）。" })),
+    );
+  }
+  return h(
+    "div",
+    { class: "pw-history" },
+    h(
+      "div",
+      { class: "pw-history-head" },
+      icon("history"),
+      h("span", { text: "「" + entry.name + "」改动历史" }),
+      h("span", { class: "pw-history-count mono", text: hist.items.length + " / " + hist.total }),
+    ),
+    h(
+      "div",
+      { class: "pw-history-list" },
+      hist.items.map((row, idx) =>
+        h(
+          "div",
+          { class: "pw-history-row" },
+          h("span", { class: "pw-history-idx mono", text: String(idx + 1).padStart(2, "0") }),
+          h(
+            "div",
+            { class: "pw-history-body" },
+            h(
+              "div",
+              { class: "pw-history-val" },
+              row.old_value ? h("del", { title: row.old_value, text: row.old_value }) : null,
+              row.old_value && row.new_value ? h("span", { class: "pw-history-arrow", text: "→" }) : null,
+              h("span", { title: row.new_value || "", text: row.new_value || "（已清空）" }),
+            ),
+            h("div", {
+              class: "pw-history-meta mono",
+              text:
+                shortTime(row.at) +
+                " · " +
+                actionText(row.action) +
+                " · " +
+                sourceText(row.actor_type) +
+                (row.actor_name ? "（" + row.actor_name + "）" : "") +
+                (row.field_name === "*" ? " · 全量动作" : ""),
+            }),
+            row.evidence ? h("div", { class: "pw-history-evi", text: "依据：" + row.evidence }) : null,
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/** 拉取单字段改动历史（默认含归档日志，取最近 20 条）。 */
+async function loadFieldHistory(fieldName) {
+  const detail = state.detail;
+  if (!detail) return;
+  state.history = { field: fieldName, items: [], loading: true, total: 0 };
+  renderDrawer();
+  try {
+    const data = await apiGet("field-history", {
+      key: detail.key,
+      field: fieldName,
+      limit: 20,
+      include_rotated: "1",
+    });
+    if (state.history.field !== fieldName) return;
+    state.history = {
+      field: fieldName,
+      items: data.items || [],
+      loading: false,
+      total: Number(data.total || (data.items || []).length),
+    };
+  } catch (err) {
+    state.history = { field: fieldName, items: [], loading: false, total: 0 };
+    toast(errorText(err), "err");
+  }
+  renderDrawer();
+}
+
 function fieldRow(entry) {
   const detail = state.detail;
+  const locked = Boolean(entry.locked);
+  const editable = canEdit() && !locked;
+  const historyOpen = state.history.field === entry.name;
   const input = h("input", {
     class: "pw-input",
     type: "text",
     value: Array.isArray(entry.value) ? entry.value.join(" | ") : String(entry.value ?? ""),
     maxlength: String((state.meta && state.meta.field_value_max_length) || 160),
-    disabled: !canEdit() ? true : null,
+    disabled: !editable ? true : null,
+    title: locked ? "该字段已锁定，需先解锁才能改。" : null,
   });
 
   const save = async (event) => {
@@ -1030,19 +1221,63 @@ function fieldRow(entry) {
     });
   };
 
+  const toggleLock = async (event) => {
+    await guard(event.currentTarget, async () => {
+      const data = await apiPost("field-lock", {
+        key: detail.key,
+        field: entry.name,
+        locked: locked ? "0" : "1",
+      });
+      toast(data.message || (locked ? "已解锁" : "已锁定"), data.ok === false ? "err" : "ok");
+      await refreshDetail(data);
+      await Promise.all([loadProfiles(state.list.page), loadStats()]);
+    });
+  };
+
+  const toggleHistory = () => {
+    if (historyOpen) {
+      state.history = { field: "", items: [], loading: false, total: 0 };
+      renderDrawer();
+      return;
+    }
+    loadFieldHistory(entry.name);
+  };
+
   return h(
     "div",
-    { class: "pw-frow" },
+    { class: "pw-frow" + (locked ? " is-locked" : "") },
     h(
       "div",
       { class: "pw-frow-top" },
       h("span", { class: "pw-frow-name", text: entry.name }),
+      locked
+        ? h(
+            "span",
+            { class: "pw-pill pw-pill--lock", title: "已锁定：" + (state.detail && state.detail.field_lock_scope_label ? state.detail.field_lock_scope_label : "禁止自动覆写") },
+            icon("lock", "pw-pill-icon"),
+            h("span", { text: "已锁定" }),
+          )
+        : null,
       entry.is_custom ? h("span", { class: "pw-pill pw-pill--warn", text: "自定义" }) : null,
       entry.source_kind ? h("span", { class: "pw-pill pw-pill--mono", text: entry.source_kind }) : null,
       h(
         "div",
         { class: "pw-frow-tools" },
-        canEdit() ? iconBtn("check", "保存修改", save, "pw-btn--accent") : null,
+        iconBtn(
+          "history",
+          historyOpen ? "收起改动历史" : "查看改动历史",
+          toggleHistory,
+          historyOpen ? "pw-btn--accent" : "pw-btn--ghost",
+        ),
+        canEdit()
+          ? iconBtn(
+              locked ? "unlock" : "lock",
+              locked ? "解锁：允许再次自动写入" : "锁定：保护该字段不被自动覆写",
+              toggleLock,
+              locked ? "pw-btn--lock is-on" : "pw-btn--lock",
+            )
+          : null,
+        editable ? iconBtn("check", "保存修改", save, "pw-btn--accent") : null,
         canEdit() ? iconBtn("trash", "删除该字段", remove, "pw-btn--danger") : null,
       ),
     ),
@@ -1061,6 +1296,7 @@ function fieldRow(entry) {
       }),
       entry.evidence ? h("span", { text: "原话依据：" + entry.evidence }) : null,
     ),
+    historyOpen ? fieldHistoryPanel(entry) : null,
   );
 }
 
@@ -1162,15 +1398,32 @@ function renderDrawer() {
     iconBtn("close", "关闭详情", closeDrawer),
   );
 
+  const builtinAvail = (detail.available_fields || []).filter((item) => !item.is_custom);
+  const filledBuiltin = builtinAvail.filter((item) => item.filled).length;
   const basics = h(
     "div",
     null,
     h("div", { class: "pw-section-label", text: "IDENTITY" }),
+    h(
+      "div",
+      { style: { marginBottom: "12px" } },
+      completenessBar(detail.completeness, {
+        label: "完整度",
+        hint: builtinAvail.length ? filledBuiltin + " / " + builtinAvail.length + " 项内置字段已填" : "",
+      }),
+    ),
     kv([
       ["用户 ID", detail.user_id],
       ["昵称", detail.subject_name || "—"],
       ["会话", detail.session_id || "（全局画像）"],
       ["平台 / 类型", (detail.platform || "unknown") + " · " + chatTypeText(detail.chat_type)],
+      [
+        "锁定字段",
+        detail.locked_count
+          ? detail.locked_count + " 个 · " + (detail.locked_fields || []).join("、")
+          : "无",
+      ],
+      ["字段锁范围", detail.field_lock_scope_label || (state.meta && state.meta.field_lock_scope_label) || "—"],
       ["建档时间", detail.created_at || "—"],
       ["最近更新", (detail.updated_at || "—") + (detail.updated_at ? "（" + relTime(detail.updated_at) + "）" : "")],
     ]),
@@ -1179,7 +1432,19 @@ function renderDrawer() {
   const fields = h(
     "div",
     null,
-    h("div", { class: "pw-section-label" }, h("span", { text: "FIELDS · " + (detail.fields || []).length })),
+    h(
+      "div",
+      { class: "pw-section-label" },
+      h("span", { text: "FIELDS · " + (detail.fields || []).length }),
+      detail.locked_count
+        ? h(
+            "span",
+            { class: "pw-pill pw-pill--lock" },
+            icon("lock", "pw-pill-icon"),
+            h("span", { text: detail.locked_count + " 锁定" }),
+          )
+        : null,
+    ),
     (detail.fields || []).length
       ? (detail.fields || []).map((entry) => fieldRow(entry))
       : notice("这条画像还没有任何字段。", null, "ghost"),
@@ -1293,7 +1558,7 @@ function renderAudit() {
     ),
     selectControl(
       filters.actor_type,
-      [["", "全部来源"], ["llm", "LLM"], ["user", "用户"], ["admin", "管理员"], ["webui", "WebUI"], ["system", "系统"]],
+      [["", "全部来源"]].concat((meta.actor_types || []).map((item) => [item.id, item.label])),
       (value) => {
         filters.actor_type = value;
         loadAudit(0);
@@ -1311,6 +1576,15 @@ function renderAudit() {
         searchTimer = setTimeout(() => loadAudit(0), 360);
       },
     }),
+    switchControl(
+      filters.include_rotated,
+      "含归档日志",
+      (checked) => {
+        filters.include_rotated = checked;
+        loadAudit(0);
+      },
+      "把已轮转的 audit.log.1 … 一起纳入检索（数据量大时会略慢）",
+    ),
     h(
       "div",
       { class: "pw-toolbar-tail" },
@@ -1323,6 +1597,7 @@ function renderAudit() {
         },
         { title: "每页条数" },
       ),
+      textBtn("sheet", "导出 CSV", (event) => guard(event.currentTarget, exportAuditCsv), "pw-btn--ghost"),
       iconBtn("refresh", "重新载入审计", (event) => guard(event.currentTarget, () => loadAudit())),
     ),
   );
@@ -1405,6 +1680,26 @@ function renderAudit() {
   fill(host, toolbar, table, rows.length ? pager : null);
 }
 
+/** 按当前审计筛选条件导出 CSV（Excel 友好，带 BOM，由后端生成）。 */
+async function exportAuditCsv() {
+  const filters = state.auditFilters;
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+  const filename = "profileweaver-audit-" + stamp + ".csv";
+  await bridge.download(
+    "audit-csv",
+    {
+      query: filters.query,
+      action: filters.action,
+      actor_type: filters.actor_type,
+      user_id: filters.user_id,
+      include_rotated: filters.include_rotated ? "1" : "0",
+      limit: 5000,
+    },
+    filename,
+  );
+  toast("已开始下载 " + filename + "（最多 5000 条，按当前筛选）", "ok");
+}
+
 async function loadAudit(offset) {
   const filters = state.auditFilters;
   try {
@@ -1413,6 +1708,7 @@ async function loadAudit(offset) {
       action: filters.action,
       actor_type: filters.actor_type,
       user_id: filters.user_id,
+      include_rotated: filters.include_rotated ? "1" : "0",
       limit: state.audit.limit,
       offset: offset === undefined || offset === null ? state.audit.offset : Math.max(0, offset),
     });
@@ -1556,8 +1852,14 @@ function renderMigrate() {
     "BACKUPS",
     "本地快照",
     {
-      desc: "插件每天首次写入时自动快照一次，导入前也会额外快照。快照保留在数据目录的 backups/ 下。",
+      desc:
+        "插件每天首次写入时自动快照一次，导入/恢复前也会额外快照，文件放在数据目录的 backups/ 下。保留策略：最多 " +
+        (meta.backup_max_count ? meta.backup_max_count + " 份" : "不限份数") +
+        " · " +
+        (meta.backup_retention_days ? meta.backup_retention_days + " 天内" : "不按天清理") +
+        "。",
       tools: [
+        h("span", { class: "pw-pill pw-pill--mono", text: backups.length + " 份" }),
         iconBtn("refresh", "刷新备份列表", (event) => guard(event.currentTarget, () => loadBackups())),
       ],
     },
@@ -1602,19 +1904,48 @@ function renderMigrate() {
                     h(
                       "td",
                       { class: "nowrap" },
-                      textBtn(
-                        "history",
-                        "恢复",
-                        async (event) => {
-                          if (!window.confirm("将用「" + item.name + "」覆盖当前全部画像。\n恢复前会自动备份当前状态。\n确认继续？")) return;
-                          await guard(event.currentTarget, async () => {
-                            const data = await apiPost("backup-restore", { name: item.name });
-                            toast(data.message || "已恢复", data.ok === false ? "err" : "ok");
-                            await Promise.all([loadProfiles(1), loadStats(), loadBackups()]);
-                          });
-                        },
-                        "pw-btn--danger",
-                        !canEdit(),
+                      h(
+                        "div",
+                        { style: { display: "flex", gap: "6px", justifyContent: "flex-end" } },
+                        textBtn(
+                          "download",
+                          "下载",
+                          (event) =>
+                            guard(event.currentTarget, async () => {
+                              await bridge.download("backup-download", { name: item.name }, item.name);
+                              toast("已开始下载 " + item.name, "ok");
+                            }),
+                          "pw-btn--ghost",
+                        ),
+                        textBtn(
+                          "history",
+                          "恢复",
+                          async (event) => {
+                            if (!window.confirm("将用「" + item.name + "」覆盖当前全部画像。\n恢复前会自动备份当前状态。\n确认继续？")) return;
+                            await guard(event.currentTarget, async () => {
+                              const data = await apiPost("backup-restore", { name: item.name });
+                              toast(data.message || "已恢复", data.ok === false ? "err" : "ok");
+                              await Promise.all([loadProfiles(1), loadStats(), loadBackups()]);
+                            });
+                          },
+                          "pw-btn--accent",
+                          !canEdit(),
+                        ),
+                        textBtn(
+                          "trash",
+                          "删除",
+                          async (event) => {
+                            if (!window.confirm("将永久删除快照文件「" + item.name + "」，此操作不可撤销。\n确认继续？")) return;
+                            await guard(event.currentTarget, async () => {
+                              const data = await apiPost("backup-delete", { name: item.name });
+                              toast(data.message || "已删除", data.ok === false ? "err" : "ok");
+                              state.backups = data.items || state.backups;
+                              renderMigrate();
+                            });
+                          },
+                          "pw-btn--danger",
+                          !canEdit(),
+                        ),
                       ),
                     ),
                   ),
@@ -1685,7 +2016,7 @@ function renderAbout() {
     h(
       "div",
       { class: "pw-hero-tail" },
-      h("span", { class: "pw-chip pw-chip--accent", text: "v" + (meta.version || "3.0.0") }),
+      h("span", { class: "pw-chip pw-chip--accent", text: "v" + (meta.version || "3.1.0") }),
       h("span", { class: "pw-chip", text: (meta.builtin_fields || []).length + " 内置字段" }),
       h("span", { class: "pw-chip", text: ((commands.user || []).length + (commands.admin || []).length) + " 条指令" }),
       h("span", { class: "pw-chip", text: ((meta.themes || []).length || 7) + " 套主题" }),
@@ -1817,7 +2148,7 @@ function renderAbout() {
     { desc: "只读展示；修改请到 AstrBot 插件配置页。" },
     kv([
       ["插件目录名", meta.plugin || "astrbot_plugin_profile_weaver"],
-      ["版本", "v" + (meta.version || "3.0.0")],
+      ["版本", "v" + (meta.version || "3.1.0")],
       ["会话隔离", meta.session_based ? "开启" : "关闭"],
       ["LLM 函数工具", meta.llm_tools_enabled ? "开启" : "关闭"],
       ["被动提取", meta.proactive_extraction ? "开启" : "关闭"],
@@ -1830,7 +2161,10 @@ function renderAbout() {
       ["字段值长度上限", (meta.field_value_max_length || 160) + " 字"],
       ["备注上限", (meta.max_notes_count || 5) + " 条/人"],
       ["审计日志上限", (meta.audit_log_max_mb || 8) + " MB（超出自动轮转）"],
-      ["备份保留", (meta.backup_retention_days || 14) + " 天"],
+      ["归档日志保留", (meta.audit_log_keep_rotated || 0) + " 份（audit.log.1 …）"],
+      ["备份保留", (meta.backup_retention_days ? meta.backup_retention_days + " 天" : "不按天清理") + " · 最多 " + (meta.backup_max_count ? meta.backup_max_count + " 份" : "不限")],
+      ["字段锁范围", (meta.field_lock_scope_label || "—") + "（" + (meta.field_lock_scope || "llm_only") + "）"],
+      ["新内置字段自动补齐", meta.auto_adopt_new_builtin_fields === false ? "关闭" : "开启"],
       ["迁移包格式", (meta.bundle_format || "profileweaver.bundle") + " v" + (meta.bundle_version || 2)],
       ["服务器时间", meta.server_time || "—"],
     ]),
@@ -1859,12 +2193,61 @@ function renderAbout() {
     ),
   );
 
+  const lockScopes = meta.field_lock_scopes || [];
+  const lockCard = card(
+    "FIELD LOCK",
+    "字段锁怎么用",
+    { desc: "锁住的字段不再被自动写入覆盖，适合「已经核对过、不希望模型再改」的关键信息。" },
+    h(
+      "div",
+      { style: { display: "flex", flexDirection: "column", gap: "12px" } },
+      lockScopes.length
+        ? h(
+            "div",
+            { style: { display: "flex", flexWrap: "wrap", gap: "9px" } },
+            lockScopes.map((item) =>
+              h(
+                "span",
+                {
+                  class: "pw-pill" + (item.id === meta.field_lock_scope ? " pw-pill--accent" : ""),
+                  title: item.id === meta.field_lock_scope ? "当前生效的范围" : "可在插件配置里切换到这一档",
+                },
+                icon(item.id === meta.field_lock_scope ? "check" : "lock", "pw-pill-icon"),
+                h("span", { text: item.label }),
+                h("span", { class: "mono", text: item.id }),
+              ),
+            ),
+          )
+        : null,
+      kv([
+        ["llm_only", "只挡 LLM 函数工具与被动提取；用户 / 管理员指令与本面板仍可改。"],
+        ["llm_and_user", "再挡用户自己的「记住 …」；管理员指令与本面板仍可改。"],
+        ["strict", "除了解锁本身，任何路径都不能再写这个字段。"],
+      ]),
+      notice(
+        "锁定 / 解锁：字段行右侧的锁形按钮，或用指令「锁定画像 字段」「解锁画像 字段」（管理员用「锁定用户画像」）。每次开关都会写一行审计。",
+        null,
+        "lock",
+      ),
+      notice(
+        "注意：整条清空（清除我的画像 / 清除用户画像）与删除整条画像不受字段锁保护——锁只针对单字段写入。",
+        "warn",
+        "shield",
+      ),
+    ),
+  );
+
   fill(
     host,
     hero,
     h("div", { class: "pw-grid pw-grid--2" }, securityCard, runtimeCard),
     h("div", { class: "pw-grid pw-grid--2", style: { marginTop: "var(--pw-gap)" } }, userCard, adminCard),
-    h("div", { class: "pw-grid pw-grid--2", style: { marginTop: "var(--pw-gap)" } }, fieldsCard, h("div", { class: "pw-grid" }, flowCard, themesCard)),
+    h(
+      "div",
+      { class: "pw-grid pw-grid--2", style: { marginTop: "var(--pw-gap)" } },
+      h("div", { class: "pw-grid" }, fieldsCard, lockCard),
+      h("div", { class: "pw-grid" }, flowCard, themesCard),
+    ),
   );
 }
 

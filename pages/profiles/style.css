@@ -387,6 +387,19 @@ body {
 .pw-btn--ghost {
   background: transparent;
 }
+/* 字段锁开关：未锁时低调，锁上后用 warn 色高亮，便于一眼扫出被保护的字段 */
+.pw-btn--lock {
+  color: var(--pw-text-3);
+}
+.pw-btn--lock:hover:not(:disabled) {
+  color: var(--pw-warn);
+  border-color: color-mix(in srgb, var(--pw-warn) 46%, transparent);
+}
+.pw-btn--lock.is-on {
+  color: var(--pw-warn);
+  border-color: color-mix(in srgb, var(--pw-warn) 52%, transparent);
+  background: color-mix(in srgb, var(--pw-warn) 14%, var(--pw-surface));
+}
 
 .pw-field {
   position: relative;
@@ -734,6 +747,16 @@ textarea.pw-input {
   font-family: var(--pw-mono);
   font-size: 11px;
 }
+.pw-pill--lock {
+  color: var(--pw-warn);
+  border-color: color-mix(in srgb, var(--pw-warn) 46%, transparent);
+  background: color-mix(in srgb, var(--pw-warn) 14%, transparent);
+}
+.pw-pill-icon {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
 
 /* -------------------------------------------------------------- KV / 指标 */
 
@@ -836,6 +859,67 @@ textarea.pw-input {
   color: var(--pw-text-3);
   min-width: 74px;
   text-align: right;
+}
+
+/* ------------------------------------------------------ 画像完整度进度条 */
+.pw-meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pw-meter--slim {
+  gap: 8px;
+  margin-top: 9px;
+}
+.pw-meter-label {
+  font-family: var(--pw-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--pw-text-3);
+  flex: 0 0 auto;
+}
+.pw-meter-track {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 99px;
+  background: var(--pw-surface-3);
+  border: 1px solid var(--pw-line);
+  overflow: hidden;
+}
+.pw-meter--slim .pw-meter-track {
+  height: 4px;
+}
+.pw-meter-fill {
+  height: 100%;
+  border-radius: 99px;
+  transition: width 420ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.pw-meter-fill.is-low {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--pw-danger) 70%, transparent),
+    var(--pw-danger)
+  );
+}
+.pw-meter-fill.is-mid {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--pw-warn) 70%, transparent),
+    var(--pw-warn)
+  );
+}
+.pw-meter-fill.is-high {
+  background: linear-gradient(90deg, var(--pw-accent), var(--pw-accent-2));
+}
+.pw-meter-val {
+  font-family: var(--pw-mono);
+  font-size: 11px;
+  color: var(--pw-text-3);
+  min-width: 34px;
+  text-align: right;
+  flex: 0 0 auto;
 }
 
 /* ------------------------------------------------------------------ 工具栏 */
@@ -1207,6 +1291,100 @@ textarea.pw-input {
   flex-direction: column;
   gap: 3px;
   word-break: break-word;
+}
+.pw-frow.is-locked {
+  border-color: color-mix(in srgb, var(--pw-warn) 40%, var(--pw-line));
+  background: color-mix(in srgb, var(--pw-warn) 6%, var(--pw-surface));
+}
+.pw-frow.is-locked .pw-input {
+  opacity: 0.72;
+}
+
+/* -------------------------------------------------- 字段改动历史折叠面板 */
+.pw-history {
+  margin-top: 10px;
+  border-top: 1px dashed var(--pw-line);
+  padding-top: 10px;
+}
+.pw-history-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--pw-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--pw-text-3);
+  margin-bottom: 8px;
+}
+.pw-history-head svg {
+  width: 13px;
+  height: 13px;
+}
+.pw-history-count {
+  margin-left: auto;
+}
+.pw-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.pw-history-row {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+}
+.pw-history-idx {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--pw-accent);
+  padding-top: 1px;
+}
+.pw-history-body {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.pw-history-val {
+  font-size: 12.5px;
+  color: var(--pw-text);
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: baseline;
+  word-break: break-word;
+}
+.pw-history-val del {
+  color: var(--pw-text-3);
+  text-decoration-thickness: 1px;
+}
+.pw-history-arrow {
+  color: var(--pw-text-3);
+}
+.pw-history-meta {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--pw-text-3);
+}
+.pw-history-evi {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--pw-text-2);
+  opacity: 0.8;
+}
+.pw-history-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--pw-text-3);
+}
+.pw-history-empty svg {
+  width: 14px;
+  height: 14px;
 }
 
 .pw-note {

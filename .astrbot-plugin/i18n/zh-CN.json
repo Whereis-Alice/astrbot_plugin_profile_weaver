@@ -1,13 +1,13 @@
 {
   "metadata": {
     "display_name": "心迹画像",
-    "short_desc": "安全可控的用户画像记忆，附带 WebUI 管理面板。",
-    "desc": "心迹画像（Profile Weaver）以「只写当前说话人」为核心原则维护用户画像：LLM 通过显式工具写入并需提供原文证据，配合身份护栏、字段黑名单与完整审计。内置 Dashboard 管理面板（7 套主题）、导入导出、每日备份与恢复、画像合并与统计。"
+    "short_desc": "安全可控的用户画像记忆，附带高设计感 WebUI 管理面板。",
+    "desc": "心迹画像（Profile Weaver）以「只写当前说话人」为核心原则维护用户画像：LLM 通过显式工具写入并需提供原文证据，配合身份护栏、字段黑名单、逐字段锁与完整审计。内置 Dashboard 管理面板（7 套主题）、画像完整度评分、字段变更历史、审计 CSV 导出、导入导出迁移、每日备份与下载/恢复/删除、画像合并与统计。"
   },
   "pages": {
     "profiles": {
       "title": "心迹画像",
-      "desc": "浏览、编辑、导出与备份所有用户画像。"
+      "desc": "浏览、编辑、锁定、导出与备份所有用户画像。"
     }
   },
   "config": {
@@ -19,9 +19,26 @@
       "description": "默认基础画像字段",
       "hint": "这里定义全局基础字段。LLM 和用户命令还可以在单个用户画像上创建自定义字段。字段越多注入提示词越长，可按需删减；「备注」建议保留在最后。"
     },
+    "auto_adopt_new_builtin_fields": {
+      "description": "插件升级时自动补齐新增内置字段",
+      "hint": "开启后，插件版本升级带来的新内置字段会自动追加到上面的字段表（只补一次，不会覆盖你的排序和删减）。如果你想完全手动管理字段表，请关闭。"
+    },
+    "builtin_fields_adopted_version": {
+      "description": "已补齐内置字段的插件版本（自动维护）",
+      "hint": "插件自动写入，用于记录上一次补齐新增内置字段的版本号，请勿手动修改。清空它会让插件在下次启动时重新补齐一次。"
+    },
     "llm_write_denylist": {
       "description": "禁止 LLM 自动写入的字段",
       "hint": "这些字段只能由用户命令或管理员手动维护，LLM 工具与自动提取都会被拒绝。适合放敏感字段。"
+    },
+    "field_lock_scope": {
+      "description": "字段锁拦截范围",
+      "hint": "字段锁是逐字段的写入保护（命令「锁定画像」或 WebUI 锁按钮），此项决定锁生效的范围。strict 下连管理员和 WebUI 也要先解锁才能改；注意「清空画像」「删除画像」始终不受字段锁约束。",
+      "labels": [
+        "仅拦截 LLM 工具与自动抽取",
+        "拦截 LLM、自动抽取与普通用户命令",
+        "拦截所有来源，必须先解锁"
+      ]
     },
     "max_notes_count": {
       "description": "备注保留条数",
@@ -53,7 +70,7 @@
     },
     "allow_user_custom_fields": {
       "description": "是否允许用户通过命令创建自定义字段",
-      "hint": "关闭后，用户用「设置画像」只能修改已有字段。"
+      "hint": "关闭后，用户用“设置画像”只能修改已有字段。"
     },
     "strict_identity_guard": {
       "description": "是否启用当前说话人身份护栏",
@@ -61,12 +78,7 @@
     },
     "evidence_match_mode": {
       "description": "evidence 校验严格度",
-      "hint": "strict：evidence 必须原样出现在本轮消息里；normalized：忽略空白与中英标点差异（推荐）；loose：只要求关键片段重叠度足够。",
-      "labels": [
-        "严格",
-        "标准化（推荐）",
-        "宽松"
-      ]
+      "hint": "strict：evidence 必须原样出现在本轮消息里；normalized：忽略空白与中英标点差异（推荐）；loose：只要求关键片段重叠度足够。"
     },
     "custom_field_name_max_length": {
       "description": "自定义字段名最大长度",
@@ -77,7 +89,7 @@
       "hint": "超过长度的内容会被截断，避免把整段聊天记录塞进画像。"
     },
     "allow_profile_in_group": {
-      "description": "是否允许在群聊里查看「我的画像」",
+      "description": "是否允许在群聊里查看“我的画像”",
       "hint": "关闭时，群聊中查看画像会被拒绝，以降低隐私泄露风险。"
     },
     "group_profile_denied_msg": {
@@ -94,11 +106,11 @@
     },
     "webui_enabled": {
       "description": "是否启用 WebUI 画像管理面板",
-      "hint": "关闭后不注册任何 Web API，Dashboard 页面将无法读写数据。修改后需要重载插件。"
+      "hint": "关闭后不注册任何 Web API，Dashboard 页面将无法读写数据。修改后需要重载插件。注意：这些接口只继承 AstrBot Dashboard 的登录态，插件层没有额外鉴权，可读取/导出全部画像与审计明文，请勿把 Dashboard 暴露到公网。"
     },
     "webui_allow_edit": {
       "description": "WebUI 是否允许写操作",
-      "hint": "关闭后 WebUI 变成只读，禁止改字段、删画像、合并、导入和恢复备份。"
+      "hint": "关闭后 WebUI 变成只读，禁止改字段、删画像、合并、导入、锁定/解锁字段、创建/恢复/删除备份。只读模式下仍可查看与导出（含审计 CSV、备份下载）。"
     },
     "webui_default_theme": {
       "description": "WebUI 默认主题",
@@ -115,15 +127,23 @@
     },
     "export_mask_user_ids": {
       "description": "导出时默认脱敏用户 ID",
-      "hint": "开启后导出文件中的用户 ID 与昵称会被打码。脱敏文件仅供查看统计，无法再导入回来。"
+      "hint": "开启后导出文件中的用户 ID 与昵称会被打码。脱敏文件仅供查看统计，无法再导入回来。备份下载与审计 CSV 不受此项影响（始终为明文）。"
     },
     "audit_log_max_mb": {
       "description": "审计日志单文件上限 (MB)",
       "hint": "超过后自动切割为带时间戳的历史文件，避免审计日志无限增长。"
     },
+    "audit_log_keep_rotated": {
+      "description": "归档审计日志保留份数",
+      "hint": "切割产生的历史审计日志最多保留几份，超出的最旧文件会被删除。0 表示切割后立刻丢弃历史文件（只保留当前日志）。"
+    },
     "backup_retention_days": {
       "description": "备份保留天数",
-      "hint": "插件每天首次写入时会自动快照一份画像，超过保留天数的备份会被清理。0 表示不清理。"
+      "hint": "插件每天首次写入时会自动快照一份画像，超过保留天数的自动备份会被清理。0 表示不按天清理（仍受下面的份数上限约束）。"
+    },
+    "backup_max_count": {
+      "description": "备份最多保留份数",
+      "hint": "备份目录里最多保留几份快照，超出时删除最旧的。0 表示不按份数清理。天数与份数两个上限同时生效。"
     },
     "debug_log_level": {
       "description": "日志级别",

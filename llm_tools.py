@@ -5,8 +5,9 @@ from typing import Any
 from pydantic import Field
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
+from astrbot.api import FunctionTool
+
 from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 FORGET_TOOL_NAME = "profileweaver_forget_field"

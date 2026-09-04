@@ -1,13 +1,13 @@
 {
   "metadata": {
     "display_name": "Profile Weaver",
-    "short_desc": "Safe, auditable user profile memory with a WebUI panel.",
-    "desc": "Profile Weaver maintains user profiles under a strict \"current speaker only\" rule: the LLM writes through explicit tools and must quote evidence from the message, backed by an identity guard, a field denylist and a full audit trail. Ships with a Dashboard panel (7 themes), import/export, daily backups and restore, profile merging and statistics."
+    "short_desc": "Safe, auditable user profile memory with a polished WebUI panel.",
+    "desc": "Profile Weaver maintains user profiles under a strict \"current speaker only\" rule: the LLM writes through explicit tools and must quote evidence from the message, backed by an identity guard, a field denylist, per-field locks and a full audit trail. Ships with a Dashboard panel (7 themes), completeness scoring, per-field change history, audit CSV export, import/export migration, daily backups with download/restore/delete, profile merging and statistics."
   },
   "pages": {
     "profiles": {
       "title": "Profile Weaver",
-      "desc": "Browse, edit, export and back up every user profile."
+      "desc": "Browse, edit, lock, export and back up every user profile."
     }
   },
   "config": {
@@ -17,11 +17,28 @@
     },
     "default_fields": {
       "description": "Default profile fields",
-      "hint": "Global base fields. The LLM and user commands can still create per-user custom fields. More fields means a longer injected prompt; keep \"备注\" (notes) last."
+      "hint": "Global base fields. The LLM and user commands can still create per-user custom fields. More fields means a longer injected prompt; keep 备注 (notes) last."
+    },
+    "auto_adopt_new_builtin_fields": {
+      "description": "Adopt new builtin fields on upgrade",
+      "hint": "On: builtin fields introduced by a plugin upgrade are appended to the field list above (once only; your ordering and removals are preserved). Turn it off to manage the field list entirely by hand."
+    },
+    "builtin_fields_adopted_version": {
+      "description": "Builtin fields adopted for version (auto-managed)",
+      "hint": "Written by the plugin to remember the last version whose new builtin fields were adopted. Do not edit; clearing it makes the plugin adopt them again on the next start."
     },
     "llm_write_denylist": {
       "description": "Fields the LLM may not write",
       "hint": "These fields can only be maintained by user commands or admins; LLM tools and auto-extraction are rejected. Good place for sensitive fields."
+    },
+    "field_lock_scope": {
+      "description": "Field lock enforcement scope",
+      "hint": "Field locks are per-field write protection (via the 锁定画像 command or the WebUI lock button); this decides who they block. Under strict, even admins and the WebUI must unlock first. Note that clearing or deleting a whole profile is never blocked by field locks.",
+      "labels": [
+        "LLM tools and auto-extraction only",
+        "LLM, auto-extraction and user commands",
+        "Everything — unlock first"
+      ]
     },
     "max_notes_count": {
       "description": "Number of notes to keep",
@@ -94,11 +111,11 @@
     },
     "webui_enabled": {
       "description": "Enable the WebUI profile panel",
-      "hint": "Off: no Web API is registered and the Dashboard page cannot read or write data. Requires a plugin reload."
+      "hint": "Off: no Web API is registered and the Dashboard page cannot read or write data. Requires a plugin reload. Note: these endpoints only inherit the AstrBot Dashboard login; the plugin adds no auth of its own and can read/export every profile and audit record, so never expose the Dashboard to the public internet."
     },
     "webui_allow_edit": {
       "description": "Allow write operations from the WebUI",
-      "hint": "Off: the WebUI becomes read-only — no field edits, deletes, merges, imports or backup restores."
+      "hint": "Off: the WebUI becomes read-only — no field edits, deletes, merges, imports, field lock changes, or backup create/restore/delete. Viewing and exporting (audit CSV, backup download) still work."
     },
     "webui_default_theme": {
       "description": "Default WebUI theme",
@@ -115,15 +132,23 @@
     },
     "export_mask_user_ids": {
       "description": "Mask user IDs on export by default",
-      "hint": "On: user IDs and names are masked in exports. Masked files are for inspection only and cannot be imported back."
+      "hint": "On: user IDs and names are masked in exports. Masked files are for inspection only and cannot be imported back. Backup downloads and audit CSV are unaffected (always plaintext)."
     },
     "audit_log_max_mb": {
       "description": "Audit log file size limit (MB)",
       "hint": "Rotates into a timestamped history file once exceeded so the audit log cannot grow forever."
     },
+    "audit_log_keep_rotated": {
+      "description": "Rotated audit logs to keep",
+      "hint": "How many rotated audit log files to keep; the oldest beyond this are deleted. 0 discards history right after rotation (current log only)."
+    },
     "backup_retention_days": {
       "description": "Backup retention (days)",
-      "hint": "A snapshot is taken on the first write of each day; backups older than this are cleaned up. 0 disables cleanup."
+      "hint": "A snapshot is taken on the first write of each day; auto backups older than this are cleaned up. 0 disables age-based cleanup (the count limit below still applies)."
+    },
+    "backup_max_count": {
+      "description": "Maximum backups to keep",
+      "hint": "How many snapshots to keep in the backup directory; the oldest are removed beyond this. 0 disables count-based cleanup. Age and count limits both apply."
     },
     "debug_log_level": {
       "description": "Log level",

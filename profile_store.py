@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import re
 import shutil
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,6 +16,7 @@ from typing import Any
 from astrbot.api import logger
 
 NOTES_FIELD_NAME = "备注"
+EMPTY_PROFILE_SUMMARY = "暂无记录"
 LEGACY_PLUGIN_DIR_NAMES = ("astrbot_plugin_soulmap", "SoulMap", "soulmap")
 CANONICAL_FIELD_ALIASES = {
     "称呼": "昵称",
@@ -47,6 +51,10 @@ DEFAULT_FIELDS: list[tuple[str, str]] = [
     ("常用语言", "日常沟通使用的语言，例如中文、英文"),
     ("沟通偏好", "希望被如何对待的沟通风格，例如简洁、多解释、少表情"),
     ("禁忌话题", "用户明确要求不要提及的话题"),
+    ("代词", "希望被使用的人称代词，例如 他 / 她 / TA"),
+    ("喜欢的话题", "聊起来最有兴趣、最容易聊开的话题方向"),
+    ("口头禅", "标志性的口头禅、常用语气词或签名式表达"),
+    ("当前目标", "用户正在推进的中长期目标、计划或备考安排"),
     (NOTES_FIELD_NAME, "短期补充备注，会自动保留最近几条"),
 ]
 
@@ -85,6 +93,21 @@ BLOCKED_PROFILE_NAME_VALUES = (
     "群主",
 )
 
+AUDIT_ROTATED_NAME_PATTERN = re.compile(r"^audit_log\.jsonl\.\d{14}$")
+BACKUP_NAME_PATTERN = re.compile(r"^profiles-[A-Za-z0-9_\-]+\.json$")
+
+DEFAULT_FIELD_LOCK_SCOPE = "llm_only"
+FIELD_LOCK_SCOPE_ACTORS: dict[str, frozenset[str]] = {
+    "llm_only": frozenset({"llm_tool", "auto_extract"}),
+    "llm_and_user": frozenset({"llm_tool", "auto_extract", "user_command"}),
+    "strict": frozenset(),
+}
+FIELD_LOCK_SCOPE_LABELS = {
+    "llm_only": "仅拦截 LLM 工具与自动抽取",
+    "llm_and_user": "拦截 LLM、自动抽取与普通用户命令",
+    "strict": "拦截所有来源，必须先解锁",
+}
+
 
 @dataclass(slots=True)
 class AuditActor:
@@ -111,6 +134,9 @@ class ProfileStore:
         field_value_max_length: int = 160,
         audit_log_max_mb: float = 8.0,
         backup_retention_days: int = 14,
+        field_lock_scope: str = DEFAULT_FIELD_LOCK_SCOPE,
+        audit_log_keep_rotated: int = 5,
+        backup_max_count: int = 60,
     ) -> None:
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +149,13 @@ class ProfileStore:
         self.custom_field_name_max_length = max(4, min(int(custom_field_name_max_length), 32))
         self.field_value_max_length = max(32, min(int(field_value_max_length), 500))
         self.audit_log_max_bytes = int(max(0.5, min(float(audit_log_max_mb), 128.0)) * 1024 * 1024)
-        self.backup_retention_days = max(1, min(int(backup_retention_days), 180))
+        # 0 表示不按天数清理（与配置说明保持一致）。
+        self.backup_retention_days = max(0, min(int(backup_retention_days), 180))
+        self.backup_max_count = max(0, min(int(backup_max_count), 500))
+        self.audit_log_keep_rotated = max(0, min(int(audit_log_keep_rotated), 200))
+        self.field_lock_scope = (
+            field_lock_scope if field_lock_scope in FIELD_LOCK_SCOPE_ACTORS else DEFAULT_FIELD_LOCK_SCOPE
+        )
         self.builtin_field_map = self._build_builtin_field_map(builtin_fields)
         self.migration_state = self._load_migration_state()
         self.profiles = self._load_profiles()
@@ -233,13 +265,16 @@ class ProfileStore:
         is_name_field = self._is_profile_name_field(normalized_field)
 
         if is_name_field:
+            # 一次性快照，避免在候选 token 循环里反复全量扫描（O(N*T) -> O(N+T)）。
+            existing_name_tokens = self._iter_profile_name_tokens(session_id)
+            existing_note_tokens = self._iter_profile_note_tokens(session_id)
             for token, display_text in candidate_tokens:
                 if token in BLOCKED_PROFILE_NAME_VALUES:
                     return OperationResult(
                         False,
                         f"拒绝写入：称呼/名字「{display_text}」属于容易冒犯、诱导或混淆系统身份的称呼。请向用户说明没有写入，并请用户换一个更合适的称呼。",
                     )
-                for existing_token, existing_text, existing_key, existing_field, owner_label in self._iter_profile_name_tokens(session_id):
+                for existing_token, existing_text, existing_key, existing_field, owner_label in existing_name_tokens:
                     if token != existing_token:
                         continue
                     if existing_key == session_key and self.normalize_field_name(existing_field) == normalized_field:
@@ -248,7 +283,7 @@ class ProfileStore:
                         False,
                         f"拒绝写入：称呼/名字「{display_text}」与 {owner_label} 的「{existing_field}：{existing_text}」重复，可能导致画像混淆。请向用户说明没有写入，并请用户换一个更明确的称呼。",
                     )
-                for note_token, note_text, _, owner_label in self._iter_profile_note_tokens(session_id):
+                for note_token, note_text, _, owner_label in existing_note_tokens:
                     if token != note_token:
                         continue
                     return OperationResult(
@@ -625,6 +660,14 @@ class ProfileStore:
                 merged_custom_fields[field_name] = merged_meta
                 changed = True
 
+        # 字段锁是"粘性"的：合并时取并集，避免合并后意外解锁。
+        merged_locks = self._normalize_lock_list(
+            [*merged.get("locked_fields", []), *incoming_record.get("locked_fields", [])]
+        )
+        if merged.get("locked_fields") != merged_locks:
+            merged["locked_fields"] = merged_locks
+            changed = True
+
         merged_updated_at = self._pick_latest_timestamp(
             merged.get("updated_at"),
             incoming_record.get("updated_at"),
@@ -678,6 +721,44 @@ class ProfileStore:
                 notes.append(text[: self.field_value_max_length])
         return notes[-self.max_notes_count :]
 
+    def _normalize_lock_list(self, raw_value: Any) -> list[str]:
+        """Normalize locked_fields into a de-duplicated, canonical, sorted list."""
+        if isinstance(raw_value, dict):
+            source_items = [name for name, flag in raw_value.items() if flag]
+        elif isinstance(raw_value, (list, tuple, set, frozenset)):
+            source_items = list(raw_value)
+        elif raw_value:
+            source_items = re.split(r"[、,，/|;；\s]+", str(raw_value))
+        else:
+            source_items = []
+        locked: list[str] = []
+        for item in source_items:
+            field_name = self.canonical_field_name(item)
+            if field_name and field_name not in locked:
+                locked.append(field_name)
+        return sorted(locked)
+
+    def _record_locked_fields(self, record: dict[str, Any]) -> list[str]:
+        locked = record.get("locked_fields")
+        if not isinstance(locked, list):
+            locked = self._normalize_lock_list(locked)
+            record["locked_fields"] = locked
+        return locked
+
+    def is_field_locked(self, record: dict[str, Any], field_name: str) -> bool:
+        return self.canonical_field_name(field_name) in self._record_locked_fields(record)
+
+    def _lock_blocks_actor(self, actor: AuditActor | None) -> bool:
+        """Whether the configured lock scope should block this actor."""
+        if self.field_lock_scope == "strict":
+            return True
+        actor_type = getattr(actor, "actor_type", "") or ""
+        allowed = FIELD_LOCK_SCOPE_ACTORS.get(self.field_lock_scope, FIELD_LOCK_SCOPE_ACTORS[DEFAULT_FIELD_LOCK_SCOPE])
+        return actor_type in allowed
+
+    def field_lock_scope_label(self) -> str:
+        return FIELD_LOCK_SCOPE_LABELS.get(self.field_lock_scope, FIELD_LOCK_SCOPE_LABELS[DEFAULT_FIELD_LOCK_SCOPE])
+
     def _normalize_profile_record(
         self,
         payload: dict[str, Any],
@@ -725,6 +806,7 @@ class ProfileStore:
                 "fields": fields,
                 "custom_fields": custom_fields,
                 "field_meta": field_meta,
+                "locked_fields": self._normalize_lock_list(payload.get("_locked_fields")),
             }
 
         created_at = str(payload.get("created_at") or self.now_text())
@@ -775,10 +857,15 @@ class ProfileStore:
             "fields": fields,
             "custom_fields": custom_fields,
             "field_meta": field_meta,
+            "locked_fields": self._normalize_lock_list(payload.get("locked_fields")),
         }
 
     def _profile_key(self, user_id: str, session_id: str | None = None) -> str:
         return f"{session_id}_{user_id}" if session_id else user_id
+
+    def profile_key(self, user_id: str, session_id: str | None = None) -> str:
+        """公开的键计算入口，供主插件与 WebUI 复用，避免各处重复拼字符串。"""
+        return self._profile_key(user_id, session_id)
 
     def _save_profiles(self) -> None:
         self._write_json(self.profiles_path, self.profiles)
@@ -801,10 +888,12 @@ class ProfileStore:
                 "fields": {},
                 "custom_fields": {},
                 "field_meta": {},
+                "locked_fields": [],
             }
         record = self.profiles[session_key]
         if subject_name:
             record["subject_name"] = subject_name
+        self._record_locked_fields(record)
         return record
 
     def get_profile(self, user_id: str, session_id: str | None = None) -> dict[str, Any]:
@@ -825,6 +914,7 @@ class ProfileStore:
     ) -> list[dict[str, Any]]:
         profile = self.get_profile(user_id, session_id)
         custom_fields = profile.get("custom_fields", {}) if profile else {}
+        locked_fields = set(self._normalize_lock_list(profile.get("locked_fields") if profile else []))
         field_defs: list[dict[str, Any]] = []
         for field_name, description in self.builtin_field_map.items():
             if field_name == NOTES_FIELD_NAME:
@@ -834,6 +924,7 @@ class ProfileStore:
                     "name": field_name,
                     "description": description,
                     "is_custom": False,
+                    "locked": field_name in locked_fields,
                 }
             )
         for field_name, metadata in custom_fields.items():
@@ -842,6 +933,7 @@ class ProfileStore:
                     "name": field_name,
                     "description": str(metadata.get("description") or "当前用户的自定义字段"),
                     "is_custom": True,
+                    "locked": field_name in locked_fields,
                 }
             )
         field_defs.append(
@@ -849,6 +941,7 @@ class ProfileStore:
                 "name": NOTES_FIELD_NAME,
                 "description": self.builtin_field_map[NOTES_FIELD_NAME],
                 "is_custom": False,
+                "locked": NOTES_FIELD_NAME in locked_fields,
             }
         )
         return field_defs
@@ -861,10 +954,13 @@ class ProfileStore:
         for item in definitions:
             field_name = item["name"]
             field_desc = item["description"]
+            tags = []
             if item["is_custom"]:
-                lines.append(f"- {field_name}：{field_desc}（当前用户自定义字段）")
-            else:
-                lines.append(f"- {field_name}：{field_desc}")
+                tags.append("当前用户自定义字段")
+            if item.get("locked"):
+                tags.append("已锁定，禁止修改")
+            suffix = f"（{'；'.join(tags)}）" if tags else ""
+            lines.append(f"- {field_name}：{field_desc}{suffix}")
         return "\n".join(lines)
 
     def format_custom_field_catalog(self, user_id: str, session_id: str | None = None) -> str:
@@ -883,11 +979,17 @@ class ProfileStore:
     def format_profile_summary(self, user_id: str, session_id: str | None = None) -> str:
         profile = self.get_profile(user_id, session_id)
         if not profile:
-            return "暂无记录"
+            return EMPTY_PROFILE_SUMMARY
 
         fields = profile.get("fields", {})
         if not fields:
-            return "暂无记录"
+            return EMPTY_PROFILE_SUMMARY
+
+        locked_fields = set(self._normalize_lock_list(profile.get("locked_fields")))
+
+        def _suffix(field_name: str) -> str:
+            # 明确标注锁定状态，避免 LLM 反复尝试写入被锁字段。
+            return "（已锁定）" if field_name in locked_fields else ""
 
         lines: list[str] = []
         for field_name in self.builtin_field_map:
@@ -896,22 +998,26 @@ class ProfileStore:
             if field_name not in fields:
                 continue
             value = fields[field_name]
-            lines.append(f"- {field_name}：{value}")
+            lines.append(f"- {field_name}：{value}{_suffix(field_name)}")
 
         custom_fields = profile.get("custom_fields", {})
         for field_name in custom_fields:
             if field_name not in fields:
                 continue
-            lines.append(f"- {field_name}：{fields[field_name]}")
+            lines.append(f"- {field_name}：{fields[field_name]}{_suffix(field_name)}")
 
         notes = fields.get(NOTES_FIELD_NAME)
         if isinstance(notes, list) and notes:
             notes_text = " ".join(f"{idx}.{note}" for idx, note in enumerate(notes, start=1))
-            lines.append(f"- {NOTES_FIELD_NAME}：{notes_text}")
+            lines.append(f"- {NOTES_FIELD_NAME}：{notes_text}{_suffix(NOTES_FIELD_NAME)}")
         elif notes:
-            lines.append(f"- {NOTES_FIELD_NAME}：{notes}")
+            lines.append(f"- {NOTES_FIELD_NAME}：{notes}{_suffix(NOTES_FIELD_NAME)}")
 
-        return "\n".join(lines) if lines else "暂无记录"
+        locked_only = sorted(locked_fields - set(fields.keys()))
+        if locked_only:
+            lines.append(f"- 已锁定但暂无内容的字段：{'、'.join(locked_only)}")
+
+        return "\n".join(lines) if lines else EMPTY_PROFILE_SUMMARY
 
     def is_known_field(self, user_id: str, field_name: str, session_id: str | None = None) -> bool:
         normalized = self.canonical_field_name(field_name)
@@ -1025,6 +1131,14 @@ class ProfileStore:
         created_custom_field = False
         session_key = self._profile_key(user_id, session_id)
 
+        if self.is_field_locked(record, normalized_field) and self._lock_blocks_actor(actor):
+            self._drop_profile_if_empty(session_key, save=False)
+            return OperationResult(
+                False,
+                f"字段「{normalized_field}」已被锁定（当前锁范围：{self.field_lock_scope_label()}），本次写入已拒绝。"
+                f"如确实需要修改，请先执行「解锁画像 {normalized_field}」。",
+            )
+
         if normalized_field not in self.builtin_field_map and normalized_field not in custom_fields:
             if not allow_custom_field:
                 return OperationResult(
@@ -1051,7 +1165,7 @@ class ProfileStore:
         if not conflict_validation.ok:
             if created_custom_field:
                 custom_fields.pop(normalized_field, None)
-            self._drop_profile_if_empty(session_key)
+            self._drop_profile_if_empty(session_key, save=False)
             return conflict_validation
 
         old_value = fields.get(normalized_field)
@@ -1107,6 +1221,8 @@ class ProfileStore:
         notes = record["fields"].get(NOTES_FIELD_NAME, [])
         note_match = NOTE_INDEX_PATTERN.fullmatch(normalized_selector)
         if note_match and isinstance(notes, list) and notes:
+            if self.is_field_locked(record, NOTES_FIELD_NAME) and self._lock_blocks_actor(actor):
+                return self._locked_field_result(NOTES_FIELD_NAME)
             note_index = int(note_match.group(1)) - 1
             if note_index < 0 or note_index >= len(notes):
                 return OperationResult(False, "备注序号不存在")
@@ -1118,11 +1234,13 @@ class ProfileStore:
                 record["fields"].pop(NOTES_FIELD_NAME, None)
                 record["field_meta"].pop(NOTES_FIELD_NAME, None)
             record["updated_at"] = self.now_text()
+            subject_name = str(record.get("subject_name") or "")
+            self._drop_profile_if_empty(session_key, save=False)
             self._save_profiles()
             self._append_audit(
                 action="delete_note",
                 user_id=user_id,
-                subject_name=record["subject_name"],
+                subject_name=subject_name,
                 session_id=session_id,
                 actor=actor,
                 field_name=f"{NOTES_FIELD_NAME}:{note_index + 1}",
@@ -1131,22 +1249,26 @@ class ProfileStore:
                 old_value=old_notes,
                 new_value=notes,
             )
-            self._drop_profile_if_empty(session_key)
             return OperationResult(True, f"已删除备注 {note_index + 1}：{deleted_note}", True)
 
         fields = record["fields"]
         if normalized_selector not in fields:
             return OperationResult(False, f"未找到字段 {normalized_selector}")
+        if self.is_field_locked(record, normalized_selector) and self._lock_blocks_actor(actor):
+            return self._locked_field_result(normalized_selector)
 
         old_value = fields.pop(normalized_selector)
         record["field_meta"].pop(normalized_selector, None)
         record["custom_fields"].pop(normalized_selector, None)
         record["updated_at"] = self.now_text()
+        subject_name = str(record.get("subject_name") or "")
+        # 删空后可能整条画像作废，先判定再统一落盘，避免重复写文件。
+        self._drop_profile_if_empty(session_key, save=False)
         self._save_profiles()
         self._append_audit(
             action="delete_field",
             user_id=user_id,
-            subject_name=record["subject_name"],
+            subject_name=subject_name,
             session_id=session_id,
             actor=actor,
             field_name=normalized_selector,
@@ -1155,17 +1277,88 @@ class ProfileStore:
             old_value=old_value,
             new_value="",
         )
-        self._drop_profile_if_empty(session_key)
         return OperationResult(True, f"已删除字段 {normalized_selector}", True)
 
-    def _drop_profile_if_empty(self, session_key: str) -> None:
+    def _locked_field_result(self, field_name: str) -> OperationResult:
+        return OperationResult(
+            False,
+            f"字段「{field_name}」已被锁定（当前锁范围：{self.field_lock_scope_label()}），本次操作已拒绝。"
+            f"如确实需要修改，请先执行「解锁画像 {field_name}」。",
+        )
+
+    def set_field_lock(
+        self,
+        *,
+        user_id: str,
+        subject_name: str,
+        session_id: str | None,
+        field_name: str,
+        locked: bool,
+        actor: AuditActor,
+    ) -> OperationResult:
+        normalized_field = self.canonical_field_name(field_name)
+        if not normalized_field:
+            return OperationResult(False, "字段名不能为空")
+
+        session_key = self._profile_key(user_id, session_id)
         record = self.profiles.get(session_key)
         if record is None:
-            return
-        if record.get("fields"):
-            return
-        self.profiles.pop(session_key, None)
+            if not locked:
+                return OperationResult(False, "没有找到对应画像，无需解锁")
+            record = self._ensure_profile(user_id, subject_name, session_id)
+
+        known = (
+            normalized_field in self.builtin_field_map
+            or normalized_field in record.get("custom_fields", {})
+            or normalized_field in record.get("fields", {})
+        )
+        if locked and not known:
+            return OperationResult(False, f"未知字段「{normalized_field}」，请先确认字段名（可用「画像字段」查看）")
+
+        locked_fields = self._record_locked_fields(record)
+        already = normalized_field in locked_fields
+        if locked and already:
+            self._drop_profile_if_empty(session_key, save=False)
+            return OperationResult(True, f"字段「{normalized_field}」本来就是锁定状态")
+        if not locked and not already:
+            self._drop_profile_if_empty(session_key, save=False)
+            return OperationResult(True, f"字段「{normalized_field}」当前没有被锁定")
+
+        old_value = list(locked_fields)
+        if locked:
+            locked_fields.append(normalized_field)
+        else:
+            locked_fields.remove(normalized_field)
+        record["locked_fields"] = sorted(set(locked_fields))
+        record["updated_at"] = self.now_text()
+        resolved_subject_name = str(record.get("subject_name") or subject_name or "")
+        self._drop_profile_if_empty(session_key, save=False)
         self._save_profiles()
+        self._append_audit(
+            action="lock_field" if locked else "unlock_field",
+            user_id=user_id,
+            subject_name=resolved_subject_name,
+            session_id=session_id,
+            actor=actor,
+            field_name=normalized_field,
+            source_kind="field_lock",
+            evidence=self.field_lock_scope_label(),
+            old_value=old_value,
+            new_value=record.get("locked_fields", []),
+        )
+        verb = "已锁定" if locked else "已解锁"
+        return OperationResult(True, f"{verb}字段「{normalized_field}」", True)
+
+    def _drop_profile_if_empty(self, session_key: str, *, save: bool = True) -> bool:
+        record = self.profiles.get(session_key)
+        if record is None:
+            return False
+        if record.get("fields") or record.get("locked_fields"):
+            return False
+        self.profiles.pop(session_key, None)
+        if save:
+            self._save_profiles()
+        return True
 
     def clear_profile(
         self,
@@ -1204,9 +1397,14 @@ class ProfileStore:
         distinct_sessions: set[str] = set()
         note_count = 0
         filled_field_count = 0
+        locked_field_count = 0
+        locked_profile_count = 0
+        completeness_total = 0.0
         latest_updated_at = ""
         active_7d = 0
+        active_30d = 0
         cutoff_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_30d = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
         for session_key, record in self.profiles.items():
             if not isinstance(record, dict):
@@ -1228,6 +1426,13 @@ class ProfileStore:
                     if field_name == NOTES_FIELD_NAME and isinstance(value, list):
                         note_count += len(value)
 
+            locked_fields = record.get("locked_fields")
+            if isinstance(locked_fields, list) and locked_fields:
+                locked_field_count += len(locked_fields)
+                locked_profile_count += 1
+
+            completeness_total += self._record_completeness(record)
+
             field_meta = record.get("field_meta", {})
             if isinstance(field_meta, dict):
                 for metadata in field_meta.values():
@@ -1240,6 +1445,8 @@ class ProfileStore:
             latest_updated_at = self._pick_latest_timestamp(latest_updated_at, updated_at)
             if updated_at and updated_at >= cutoff_7d:
                 active_7d += 1
+            if updated_at and updated_at >= cutoff_30d:
+                active_30d += 1
 
         profile_count = len(self.profiles)
         return {
@@ -1251,14 +1458,33 @@ class ProfileStore:
             "source_counts": source_counts,
             "note_count": note_count,
             "filled_field_count": filled_field_count,
+            "locked_field_count": locked_field_count,
+            "locked_profile_count": locked_profile_count,
             "avg_fields_per_profile": round(filled_field_count / profile_count, 2) if profile_count else 0.0,
+            "avg_completeness": round(completeness_total / profile_count, 1) if profile_count else 0.0,
             "latest_updated_at": latest_updated_at,
             "active_profiles_7d": active_7d,
+            "active_profiles_30d": active_30d,
             "audit_log_bytes": self.audit_log_path.stat().st_size if self.audit_log_path.exists() else 0,
+            "audit_rotated_count": len(self._list_rotated_audit_logs()),
             "profiles_file_bytes": self.profiles_path.stat().st_size if self.profiles_path.exists() else 0,
+            "backup_count": len(self.list_backups()),
             "builtin_field_count": len(self.builtin_field_map),
             "custom_field_kind_count": len(custom_field_counts),
+            "field_lock_scope": self.field_lock_scope,
+            "field_lock_scope_label": self.field_lock_scope_label(),
         }
+
+    def _record_completeness(self, record: dict[str, Any]) -> float:
+        """Percentage of builtin fields that already carry a value for this profile."""
+        total = len(self.builtin_field_map)
+        if not total:
+            return 0.0
+        fields = record.get("fields", {})
+        if not isinstance(fields, dict):
+            return 0.0
+        filled = sum(1 for field_name in self.builtin_field_map if fields.get(field_name))
+        return round(filled * 100 / total, 1)
 
     def read_recent_audit(
         self,
@@ -1266,21 +1492,48 @@ class ProfileStore:
         user_id: str | None = None,
         session_id: str | None = None,
         limit: int = 10,
+        include_rotated: bool = False,
     ) -> list[dict[str, Any]]:
-        if not self.audit_log_path.exists():
+        matched: deque[dict[str, Any]] = deque(maxlen=max(1, min(int(limit), 50)))
+        for entry in self._iter_audit_entries(include_rotated=include_rotated):
+            if user_id and str(entry.get("subject_user_id")) != user_id:
+                continue
+            if session_id is not None and str(entry.get("session_id") or "") != str(session_id or ""):
+                continue
+            matched.append(entry)
+        return list(reversed(matched))
+
+    def read_field_history(
+        self,
+        *,
+        user_id: str,
+        session_id: str | None = None,
+        field_name: str = "",
+        limit: int = 20,
+        include_rotated: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Replay the audit trail for a single field so the WebUI can show its history."""
+        normalized_field = self.canonical_field_name(field_name)
+        if not normalized_field:
             return []
-        matched = deque(maxlen=max(1, min(int(limit), 50)))
-        with self.audit_log_path.open("r", encoding="utf-8") as audit_file:
-            for line in audit_file:
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if user_id and str(entry.get("subject_user_id")) != user_id:
-                    continue
-                if session_id is not None and str(entry.get("session_id") or "") != str(session_id or ""):
-                    continue
+        note_prefix = f"{NOTES_FIELD_NAME}:"
+        matched: deque[dict[str, Any]] = deque(maxlen=max(1, min(int(limit), 200)))
+        for entry in self._iter_audit_entries(include_rotated=include_rotated):
+            if user_id and str(entry.get("subject_user_id")) != str(user_id):
+                continue
+            if session_id is not None and str(entry.get("session_id") or "") != str(session_id or ""):
+                continue
+            entry_field = str(entry.get("field_name") or "")
+            if entry_field == "*":
+                # 清空/恢复/导入这类全量动作对任何字段都有意义，保留。
                 matched.append(entry)
+                continue
+            if normalized_field == NOTES_FIELD_NAME:
+                if entry_field != NOTES_FIELD_NAME and not entry_field.startswith(note_prefix):
+                    continue
+            elif self.canonical_field_name(entry_field) != normalized_field:
+                continue
+            matched.append(entry)
         return list(reversed(matched))
 
     # ------------------------------------------------------------------
@@ -1372,13 +1625,33 @@ class ProfileStore:
     def _prune_backups(self) -> None:
         if not self.backup_dir.exists():
             return
-        cutoff = datetime.now() - timedelta(days=self.backup_retention_days)
+        surviving: list[tuple[float, Path]] = []
+        # backup_retention_days == 0 表示不按天数清理，只按个数上限收敛。
+        cutoff = (
+            datetime.now() - timedelta(days=self.backup_retention_days)
+            if self.backup_retention_days > 0
+            else None
+        )
         for path in self.backup_dir.glob("profiles-*.json"):
             try:
-                if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
-                    path.unlink(missing_ok=True)
+                mtime = path.stat().st_mtime
             except OSError:
                 continue
+            if cutoff is not None and datetime.fromtimestamp(mtime) < cutoff:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            surviving.append((mtime, path))
+
+        if self.backup_max_count and len(surviving) > self.backup_max_count:
+            surviving.sort(key=lambda item: item[0], reverse=True)
+            for _, path in surviving[self.backup_max_count :]:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    continue
 
     def list_backups(self) -> list[dict[str, Any]]:
         if not self.backup_dir.exists():
@@ -1398,9 +1671,51 @@ class ProfileStore:
             )
         return items
 
+    def read_backup_text(self, name: str) -> tuple[bool, str, str]:
+        """Read one snapshot verbatim so the WebUI can offer it as a download.
+
+        Returns ``(ok, payload_or_error, safe_name)``; the caller never sees a
+        caller-supplied path, only the sanitised file name.
+        """
+        safe_name = Path(str(name or "")).name
+        if not BACKUP_NAME_PATTERN.fullmatch(safe_name):
+            return False, "备份文件名不合法", safe_name
+        target = self.backup_dir / safe_name
+        if not target.exists():
+            return False, f"备份 {safe_name} 不存在", safe_name
+        try:
+            return True, target.read_text(encoding="utf-8"), safe_name
+        except OSError as exc:
+            return False, f"读取备份失败：{exc}", safe_name
+
+    def delete_backup(self, name: str, actor: AuditActor) -> OperationResult:
+        safe_name = Path(str(name or "")).name
+        if not BACKUP_NAME_PATTERN.fullmatch(safe_name):
+            return OperationResult(False, "备份文件名不合法")
+        target = self.backup_dir / safe_name
+        if not target.exists():
+            return OperationResult(False, f"备份 {safe_name} 不存在")
+        try:
+            target.unlink()
+        except OSError as exc:
+            return OperationResult(False, f"删除备份失败：{exc}")
+        self._append_audit(
+            action="delete_backup",
+            user_id="*",
+            subject_name="",
+            session_id=None,
+            actor=actor,
+            field_name="*",
+            source_kind="backup_delete",
+            evidence=safe_name,
+            old_value=safe_name,
+            new_value="",
+        )
+        return OperationResult(True, f"已删除备份 {safe_name}", True)
+
     def restore_backup(self, name: str, actor: AuditActor) -> OperationResult:
         safe_name = Path(str(name or "")).name
-        if not safe_name or not safe_name.startswith("profiles-") or not safe_name.endswith(".json"):
+        if not BACKUP_NAME_PATTERN.fullmatch(safe_name):
             return OperationResult(False, "备份文件名不合法")
         source = self.backup_dir / safe_name
         if not source.exists():
@@ -1442,6 +1757,54 @@ class ProfileStore:
             logger.info("[ProfileWeaver] 审计日志已轮转为 %s", rotated.name)
         except OSError as exc:
             logger.warning("[ProfileWeaver] 审计日志轮转失败：%s", exc)
+            return
+        self._prune_rotated_audit_logs()
+
+    def _list_rotated_audit_logs(self) -> list[Path]:
+        """Rotated audit logs, newest first (names embed a sortable timestamp)."""
+        parent = self.audit_log_path.parent
+        if not parent.exists():
+            return []
+        rotated = [
+            path
+            for path in parent.glob(f"{self.audit_log_path.name}.*")
+            if AUDIT_ROTATED_NAME_PATTERN.fullmatch(path.name)
+        ]
+        return sorted(rotated, key=lambda path: path.name, reverse=True)
+
+    def _prune_rotated_audit_logs(self) -> None:
+        # 0 表示全部保留。
+        if not self.audit_log_keep_rotated:
+            return
+        for path in self._list_rotated_audit_logs()[self.audit_log_keep_rotated :]:
+            try:
+                path.unlink(missing_ok=True)
+                logger.info("[ProfileWeaver] 已清理过期审计日志 %s", path.name)
+            except OSError:
+                continue
+
+    def _audit_log_paths(self, *, include_rotated: bool) -> list[Path]:
+        """Audit logs in chronological order (oldest rotated file first)."""
+        paths: list[Path] = []
+        if include_rotated:
+            paths.extend(reversed(self._list_rotated_audit_logs()))
+        if self.audit_log_path.exists():
+            paths.append(self.audit_log_path)
+        return paths
+
+    def _iter_audit_entries(self, *, include_rotated: bool = False) -> Iterator[dict[str, Any]]:
+        for path in self._audit_log_paths(include_rotated=include_rotated):
+            try:
+                with path.open("r", encoding="utf-8") as audit_file:
+                    for line in audit_file:
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(entry, dict):
+                            yield entry
+            except OSError as exc:
+                logger.warning("[ProfileWeaver] 读取审计日志 %s 失败：%s", path.name, exc)
 
     # ------------------------------------------------------------------
     # 面向 WebUI 的查询接口
@@ -1471,6 +1834,7 @@ class ProfileStore:
                     break
 
         session_info = self.describe_session(session_id)
+        locked_fields = self._normalize_lock_list(record.get("locked_fields") if isinstance(record, dict) else [])
         return {
             "key": session_key,
             "user_id": user_id,
@@ -1482,6 +1846,9 @@ class ProfileStore:
             "field_count": len([name for name in fields if name != NOTES_FIELD_NAME]),
             "custom_field_count": len([name for name in custom_fields if name in fields]),
             "note_count": note_count,
+            "locked_count": len(locked_fields),
+            "locked_fields": locked_fields,
+            "completeness": self._record_completeness(record if isinstance(record, dict) else {}),
             "created_at": str(record.get("created_at") or ""),
             "updated_at": str(record.get("updated_at") or ""),
             "preview": preview,
@@ -1497,6 +1864,7 @@ class ProfileStore:
         sort: str = "updated_desc",
         page: int = 1,
         page_size: int = 20,
+        locked_only: bool = False,
     ) -> dict[str, Any]:
         keyword = str(query or "").strip().casefold()
         wanted_field = self.canonical_field_name(field) if field else ""
@@ -1509,6 +1877,8 @@ class ProfileStore:
             if chat_type not in ("", "all") and summary["chat_type"] != chat_type:
                 continue
             if platform not in ("", "all") and summary["platform"] != platform:
+                continue
+            if locked_only and not summary["locked_count"]:
                 continue
             fields = record.get("fields", {})
             if wanted_field and wanted_field not in (fields if isinstance(fields, dict) else {}):
@@ -1535,6 +1905,10 @@ class ProfileStore:
             rows.sort(key=lambda item: item["created_at"], reverse=reverse)
         elif sort.startswith("name"):
             rows.sort(key=lambda item: item["display_name"].casefold(), reverse=reverse)
+        elif sort.startswith("completeness"):
+            rows.sort(key=lambda item: (item["completeness"], item["updated_at"]), reverse=reverse)
+        elif sort.startswith("locked"):
+            rows.sort(key=lambda item: (item["locked_count"], item["updated_at"]), reverse=reverse)
         else:
             rows.sort(key=lambda item: item["updated_at"], reverse=reverse)
 
@@ -1581,6 +1955,9 @@ class ProfileStore:
             if name != NOTES_FIELD_NAME and name not in ordered_names
         )
 
+        locked_fields = self._normalize_lock_list(record.get("locked_fields"))
+        locked_set = set(locked_fields)
+
         entries: list[dict[str, Any]] = []
         for field_name in ordered_names:
             metadata = field_meta.get(field_name, {}) if isinstance(field_meta.get(field_name), dict) else {}
@@ -1589,6 +1966,7 @@ class ProfileStore:
                     "name": field_name,
                     "value": fields[field_name],
                     "is_custom": field_name in custom_fields,
+                    "locked": field_name in locked_set,
                     "description": str((custom_fields.get(field_name) or {}).get("description") or "")
                     if field_name in custom_fields
                     else self.builtin_field_map.get(field_name, ""),
@@ -1620,7 +1998,33 @@ class ProfileStore:
             "notes_meta": {
                 "updated_at": str(notes_meta.get("updated_at") or ""),
                 "updated_by": str(notes_meta.get("updated_by") or ""),
+                "locked": NOTES_FIELD_NAME in locked_set,
             },
+            "locked_fields": locked_fields,
+            "locked_count": len(locked_fields),
+            "completeness": self._record_completeness(record),
+            "field_lock_scope": self.field_lock_scope,
+            "field_lock_scope_label": self.field_lock_scope_label(),
+            "available_fields": [
+                {
+                    "name": name,
+                    "description": description,
+                    "is_custom": False,
+                    "locked": name in locked_set,
+                    "filled": bool(fields.get(name)),
+                }
+                for name, description in self.builtin_field_map.items()
+            ]
+            + [
+                {
+                    "name": name,
+                    "description": str((meta or {}).get("description") or ""),
+                    "is_custom": True,
+                    "locked": name in locked_set,
+                    "filled": bool(fields.get(name)),
+                }
+                for name, meta in custom_fields.items()
+            ],
             "summary": self.format_profile_summary(user_id, session_id or None),
         }
 
@@ -1692,6 +2096,31 @@ class ProfileStore:
         )
         return OperationResult(True, f"已把 {source_key} 合并进 {target_key}", True)
 
+    def _filter_audit_entries(
+        self,
+        *,
+        user_id: str = "",
+        session_id: str | None = None,
+        action: str = "",
+        actor_type: str = "",
+        keyword: str = "",
+        include_rotated: bool = False,
+    ) -> list[dict[str, Any]]:
+        matched: list[dict[str, Any]] = []
+        for entry in self._iter_audit_entries(include_rotated=include_rotated):
+            if user_id and str(entry.get("subject_user_id") or "") != str(user_id):
+                continue
+            if session_id is not None and str(entry.get("session_id") or "") != str(session_id or ""):
+                continue
+            if action and str(entry.get("action") or "") != action:
+                continue
+            if actor_type and str(entry.get("actor_type") or "") != actor_type:
+                continue
+            if keyword and keyword not in json.dumps(entry, ensure_ascii=False).casefold():
+                continue
+            matched.append(entry)
+        return matched
+
     def read_audit(
         self,
         *,
@@ -1702,39 +2131,17 @@ class ProfileStore:
         query: str = "",
         limit: int = 50,
         offset: int = 0,
+        include_rotated: bool = False,
     ) -> dict[str, Any]:
-        if not self.audit_log_path.exists():
-            return {"total": 0, "items": [], "offset": 0, "limit": limit}
-
         keyword = str(query or "").strip().casefold()
-        matched: list[dict[str, Any]] = []
-        try:
-            with self.audit_log_path.open("r", encoding="utf-8") as audit_file:
-                for line in audit_file:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    if not isinstance(entry, dict):
-                        continue
-                    if user_id and str(entry.get("subject_user_id") or "") != str(user_id):
-                        continue
-                    if session_id is not None and str(entry.get("session_id") or "") != str(session_id or ""):
-                        continue
-                    if action and str(entry.get("action") or "") != action:
-                        continue
-                    if actor_type and str(entry.get("actor_type") or "") != actor_type:
-                        continue
-                    if keyword and keyword not in json.dumps(entry, ensure_ascii=False).casefold():
-                        continue
-                    matched.append(entry)
-        except OSError as exc:
-            logger.warning("[ProfileWeaver] 读取审计日志失败：%s", exc)
-            return {"total": 0, "items": [], "offset": 0, "limit": limit}
-
+        matched = self._filter_audit_entries(
+            user_id=user_id,
+            session_id=session_id,
+            action=action,
+            actor_type=actor_type,
+            keyword=keyword,
+            include_rotated=include_rotated,
+        )
         matched.reverse()
         total = len(matched)
         limit = max(1, min(int(limit or 50), 500))
@@ -1746,16 +2153,76 @@ class ProfileStore:
             "items": matched[offset : offset + limit],
         }
 
+    AUDIT_CSV_COLUMNS = (
+        "at",
+        "session_id",
+        "subject_user_id",
+        "subject_name",
+        "actor_type",
+        "actor_id",
+        "actor_name",
+        "action",
+        "field_name",
+        "source_kind",
+        "evidence",
+        "old_value",
+        "new_value",
+    )
+
+    def export_audit_csv(
+        self,
+        *,
+        user_id: str = "",
+        session_id: str | None = None,
+        action: str = "",
+        actor_type: str = "",
+        query: str = "",
+        limit: int = 5000,
+        include_rotated: bool = True,
+    ) -> str:
+        """Render the (filtered) audit trail as Excel-friendly CSV text."""
+        matched = self._filter_audit_entries(
+            user_id=user_id,
+            session_id=session_id,
+            action=action,
+            actor_type=actor_type,
+            keyword=str(query or "").strip().casefold(),
+            include_rotated=include_rotated,
+        )
+        matched.reverse()
+        capped = matched[: max(1, min(int(limit or 5000), 50000))]
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\r\n")
+        writer.writerow(self.AUDIT_CSV_COLUMNS)
+        for entry in capped:
+            writer.writerow([str(entry.get(column) or "") for column in self.AUDIT_CSV_COLUMNS])
+        return buffer.getvalue()
+
+    ACTOR_TYPE_LABELS = {
+        "user_command": "用户指令",
+        "admin_command": "管理员指令",
+        "llm_tool": "LLM 工具",
+        "auto_extract": "自动抽取",
+        "webui": "WebUI",
+    }
+
+    def actor_type_catalog(self) -> list[dict[str, str]]:
+        """Authoritative actor_type list so the WebUI filter can never drift."""
+        return [{"id": key, "label": label} for key, label in self.ACTOR_TYPE_LABELS.items()]
+
     def audit_action_catalog(self) -> list[str]:
         return [
             "upsert_field",
             "append_note",
             "delete_field",
             "delete_note",
+            "lock_field",
+            "unlock_field",
             "clear_profile",
             "merge_profile",
             "import_bundle",
             "restore_backup",
+            "delete_backup",
         ]
 
     # ------------------------------------------------------------------
@@ -1804,7 +2271,9 @@ class ProfileStore:
                         notes_meta["actor_id"] = self._mask_id(str(notes_meta["actor_id"]))
                     if notes_meta.get("actor_name"):
                         notes_meta["actor_name"] = self._mask_id(str(notes_meta["actor_name"]))
-                session_key = f"{session_id}_{masked_user_id}" if session_id else masked_user_id
+                # session_id 第 3 段是群号/私聊号，脱敏导出时同样不能原样带出去。
+                masked_session_id = self._mask_session_id(session_id)
+                session_key = f"{masked_session_id}_{masked_user_id}" if masked_session_id else masked_user_id
             profiles[session_key] = record
 
         bundle: dict[str, Any] = {
@@ -1814,18 +2283,31 @@ class ProfileStore:
             "exported_at": self.now_text(),
             "masked": bool(mask_user_ids),
             "builtin_fields": list(self.builtin_field_map.keys()),
+            "field_lock_scope": self.field_lock_scope,
             "profile_count": len(profiles),
             "profiles": profiles,
         }
         if include_audit:
-            entries = self.read_audit(limit=max(1, min(int(audit_limit), 500)))["items"]
+            entries = self.read_audit(limit=max(1, min(int(audit_limit), 500)), include_rotated=True)["items"]
             if mask_user_ids:
                 for entry in entries:
                     for key_name in ("subject_user_id", "subject_name", "actor_id", "actor_name"):
                         if entry.get(key_name):
                             entry[key_name] = self._mask_id(str(entry[key_name]))
+                    if entry.get("session_id"):
+                        entry["session_id"] = self._mask_session_id(str(entry["session_id"]))
             bundle["audit"] = entries
         return bundle
+
+    def _mask_session_id(self, session_id: str) -> str:
+        raw = str(session_id or "")
+        if not raw:
+            return ""
+        parts = raw.split(":")
+        if len(parts) < 3:
+            return self._mask_id(raw)
+        parts[2] = self._mask_id(parts[2])
+        return ":".join(parts)
 
     def import_bundle(
         self,
@@ -1841,6 +2323,19 @@ class ProfileStore:
                 return {"ok": False, "message": f"JSON 解析失败：{exc}"}
         if not isinstance(payload, dict):
             return {"ok": False, "message": "导入内容必须是 JSON 对象"}
+
+        declared_format = str(payload.get("format") or "").strip()
+        if declared_format and declared_format != self.BUNDLE_FORMAT:
+            return {
+                "ok": False,
+                "message": f"文件格式不匹配：期望 {self.BUNDLE_FORMAT}，实际 {declared_format}。请确认导出来源。",
+            }
+        declared_version = payload.get("version")
+        if declared_format and isinstance(declared_version, int) and declared_version > self.BUNDLE_VERSION:
+            return {
+                "ok": False,
+                "message": f"备份版本 v{declared_version} 高于当前插件支持的 v{self.BUNDLE_VERSION}，请先升级插件。",
+            }
 
         raw_profiles = payload.get("profiles")
         if not isinstance(raw_profiles, dict):
